@@ -1,0 +1,16 @@
+spring:
+  application:
+    name: bocbang-backend
+  servlet:
+    multipart:
+      max-file-size: 20MB
+      max-request-size: 20MB
+
+server:
+  port: 8080
+
+stt:
+  default-sample-rate: 16000
+  vosk:
+    # Relative to the working directory. Download: https://alphacephei.com/vosk/models (Vietnamese: vosk-model-small-vn-0.4)
+    model-path: ${STT_VOSK_MODEL_PATH:models/vosk-model-small-vn-0.4}

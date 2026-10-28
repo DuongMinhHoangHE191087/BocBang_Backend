@@ -1,0 +1,12 @@
+.gradle/
+build/
+out/
+models/
+*.log
+
+.idea/
+*.iml
+.vscode/
+.kotlin/
+.claude/settings.local.json
+local.properties
