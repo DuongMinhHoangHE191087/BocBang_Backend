@@ -5,7 +5,13 @@
   const FRAME_SAMPLES = 1600; // 100 ms
   const FRAME_MS = 100;
   const STATUS_POLL_MS = 1500;
-  const FINAL_WAIT_MS = 1200;
+  // Engines that answer only after an end command (the native one) need the end sent when the speaker pauses,
+  // and a long wait for the last answer after Stop.
+  const FINAL_TIMEOUT_MS = 30000;
+  const SPEECH_RMS = 0.015; // frame loudness that counts as speech
+  const PAUSE_FRAMES = 8; // 0.8 s of quiet closes an utterance
+  const MIN_SPEECH_FRAMES = 3;
+  const MAX_UTTERANCE_FRAMES = 250; // 25 s, well inside the server's 60 s limit
 
   const $ = (id) => document.getElementById(id);
   const el = {
@@ -44,6 +50,9 @@
       this.handlers = handlers;
       this.ws = null;
       this.ready = false;
+      this.audioSinceEnd = false;
+      /** Ends sent and not yet answered by a final (or by a recognition_failed in its place). */
+      this.pendingEnds = 0;
     }
 
     open() {
@@ -58,6 +67,9 @@
         const fail = (error) => { if (!settled) { settled = true; reject(error); } };
         ws.onmessage = (event) => {
           const message = JSON.parse(event.data);
+          if (message.type === 'final' || message.code === 'recognition_failed') {
+            this.pendingEnds = Math.max(0, this.pendingEnds - 1);
+          }
           if (message.type === 'ready') {
             this.ready = true;
             settled = true;
@@ -81,12 +93,15 @@
     sendPcm(pcm) {
       if (this.ready && this.ws.readyState === WebSocket.OPEN) {
         this.ws.send(pcm);
+        this.audioSinceEnd = true;
       }
     }
 
     end() {
-      if (this.ready && this.ws.readyState === WebSocket.OPEN) {
+      if (this.ready && this.audioSinceEnd && this.ws.readyState === WebSocket.OPEN) {
         this.ws.send(JSON.stringify({ type: 'end' }));
+        this.audioSinceEnd = false;
+        this.pendingEnds++;
       }
     }
 
@@ -356,6 +371,13 @@
         renderStats();
       },
       onError(message) {
+        if (message.code === 'recognition_failed' || message.code === 'invalid_audio') {
+          setTile(id, 'live', 'Bỏ qua một câu', message.message);
+          if (id === 0) {
+            setStatus(`Bỏ qua một câu: ${message.message}`, true);
+          }
+          return;
+        }
         setTile(id, message.code === 'capacity_exceeded' ? 'refused' : 'failed', 'Bị từ chối', message.message);
       },
       onClose(event, reason) {
@@ -378,13 +400,38 @@
     tiles.clear();
     ribbon.reset();
     Object.assign(run, { frames: 0, recentLags: [], lagMax: 0, connections: [] });
+    Object.assign(utterance, { loud: 0, quiet: 0, total: 0 });
     renderStats();
+  }
+
+  const utterance = { loud: 0, quiet: 0, total: 0 };
+
+  /** Closes the current utterance when the speaker pauses, or runs on too long, by sending end on every stream. */
+  function trackPause(rms) {
+    if (rms >= SPEECH_RMS) {
+      utterance.loud++;
+      utterance.quiet = 0;
+    } else if (utterance.loud > 0) {
+      utterance.quiet++;
+    }
+    if (utterance.loud > 0) {
+      utterance.total++;
+    }
+    const paused = utterance.quiet >= PAUSE_FRAMES;
+    const tooLong = utterance.total >= MAX_UTTERANCE_FRAMES;
+    if ((paused && utterance.loud >= MIN_SPEECH_FRAMES) || tooLong) {
+      run.connections.forEach((connection) => connection.end());
+    }
+    if (paused || tooLong) {
+      Object.assign(utterance, { loud: 0, quiet: 0, total: 0 });
+    }
   }
 
   function onFrame(frame, rms) {
     run.frames++;
     ribbon.push(rms);
     run.connections.forEach((connection) => connection.sendPcm(frame));
+    trackPause(rms);
     if (run.frames % 5 === 0) {
       renderStats();
     }
@@ -452,14 +499,22 @@
     const { source, connections } = run;
     source.stop();
     el.toggle.disabled = true;
-    setStatus('Đang chốt câu cuối...');
+    setStatus('Đang nhận dạng câu cuối...');
     connections.forEach((connection) => connection.end());
-    await sleep(FINAL_WAIT_MS);
+    const deadline = performance.now() + FINAL_TIMEOUT_MS;
+    while (performance.now() < deadline && connections.some((c) => c.ready && c.pendingEnds > 0)) {
+      await sleep(100);
+    }
+    const unanswered = connections.some((c) => c.ready && c.pendingEnds > 0);
     connections.forEach((connection) => connection.close());
     el.toggle.textContent = 'Bắt đầu';
     el.toggle.classList.remove('running');
     el.toggle.disabled = false;
-    setStatus(message || 'Đã dừng.', isError);
+    if (unanswered) {
+      setStatus('Đã dừng, nhưng máy chủ chưa trả kịp kết quả câu cuối.', true);
+    } else {
+      setStatus(message || 'Đã dừng.', isError);
+    }
     renderStats();
   }
 

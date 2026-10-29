@@ -39,6 +39,8 @@ Lỗi luôn có `code` (`invalid_sample_rate`, `capacity_exceeded`, `overloaded`
 - Slot của luồng WebSocket (`SessionLimiter.Permit`) chỉ được trả khi `SessionPipeline.Listener.onClosed` chạy, tức recognizer đã đóng thật, không phải lúc ngắt kết nối. Đừng trả permit ở handler.
 - `SessionPipeline` phân loại lỗi engine: `IllegalArgumentException` và `SpeechRecognitionException` gọi `onRejected` (giữ phiên); mọi lỗi khác, kể cả `Error` như `UnsatisfiedLinkError`, gọi `onFailure` (đóng phiên). Nhiều `end` liên tiếp không có audio xen giữa gộp thành một `final`.
 - `max-buffered-audio` mặc định 30s vì `finish()` của engine `jni` có thể mất nhiều giây, trong lúc đó client vẫn gửi câu kế tiếp.
+- `POST /transcriptions` giữ cả file trong RAM nên chặn ở `stt.max-utterance-seconds` (đọc dư đúng một byte rồi từ chối), trong khi giới hạn upload của Spring là 500 MB cho `/jobs`. Đừng nâng giới hạn này mà không bỏ việc nạp cả file.
+- `/api/stt` cũ phục vụ cùng controller, `LegacyApiDeprecationFilter` gắn `Deprecation` và `Link: rel="successor-version"`. Demo (`static/app.js`) tự gửi `end` khi ngừng nói và chờ câu cuối sau Dừng; `tools/load-test.mjs` cần `--end-every` với engine chỉ trả sau `end`.
 - REST upload bọc session trong `GuardedSession`: thread request bị ngắt không được đóng session khi một thread suy luận còn đang ở trong engine. Tần số lấy mẫu của WAV phải bằng `stt.sample-rate`.
 - Health: indicator `stt` báo `BUSY` khi đầy slot. `application.yml` xếp `BUSY` dưới `UP` cho `/actuator/health` (vẫn 200) và trên `UP` cho nhóm readiness (503). `InferenceExecutor` nhận `SpeechToTextEngine` làm tham số để bị hủy trước engine.
 - Container WebSocket mặc định chỉ nhận frame nhị phân 8 KB; `WebSocketConfig` nâng lên `stt.websocket.max-frame-bytes`.

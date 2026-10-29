@@ -28,7 +28,7 @@ Nhận PCM qua WebSocket `/ws/stt` và trả JSON realtime. REST nằm dưới `
 - Biên dịch JNI cho máy host: `./scripts/build-native.sh host`
 - Biên dịch JNI cho board G520: `./scripts/build-native.sh android-arm64`
 - Chạy test Java + JNI: `./gradlew test` (nhớ chạy `./gradlew --stop` sau khi xong). `SttEndToEndTest` khởi động cả server trên cổng ngẫu nhiên với `FakeSpeechToTextEngine` (`stt.engine=test`), không cần `.so` hay model. `JniSpeechEngineTest` tự bỏ qua khi chưa có `.so` host hoặc model.
-- Thử tải: `node tools/load-test.mjs host:port số-kết-nối số-giây file.wav` (Node 22+) với server đang chạy, dùng `STT_ENGINE=mock` nếu chưa có model. Đo sức chứa luôn dùng tiếng nói thật, không dùng im lặng. Khi đo, tắt hết tiến trình nền nặng, nếu không số đo sai (từng gấp 3 lần).
+- Thử tải: `node tools/load-test.mjs host:port số-kết-nối số-giây file.wav [--end-every=8] [--api-key=khóa]` (Node 22+) với server đang chạy, dùng `STT_ENGINE=mock` nếu chưa có model. Với engine `jni` luôn thêm `--end-every`, vì engine đó chỉ trả văn bản sau `end`. Đo sức chứa luôn dùng tiếng nói thật, không dùng im lặng. Khi đo, tắt hết tiến trình nền nặng, nếu không số đo sai (từng gấp 3 lần).
 
 ## Gradle và JVM trên máy dev Windows 16 GB
 

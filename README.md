@@ -81,7 +81,7 @@ Mở `http://localhost:8080/`.
 - **Gửi cả file qua REST**: thử `POST /api/v1/stt/transcriptions` với cùng file.
 - Góc trên phải hiện engine và mức tải hiện tại của máy chủ.
 
-Engine `jni` chỉ trả văn bản sau khi nhận `end`, nên khung "đang nói" chỉ hiện chữ khi bạn dừng; engine `mock` có chữ chạy liên tục.
+Engine `jni` chỉ trả văn bản sau khi nhận `end`, nên demo tự gửi `end` khi bạn ngừng nói khoảng 0,8 giây (và sau 25 giây nếu nói liền), rồi chữ của câu đó hiện ra. Bấm Dừng thì demo chờ tối đa 30 giây cho câu cuối; quá hạn nó báo chưa nhận được thay vì im lặng đóng kết nối. Engine `mock` có chữ chạy liên tục.
 
 ## API
 
@@ -93,9 +93,9 @@ Engine `jni` chỉ trả văn bản sau khi nhận `end`, nên khung "đang nói
 | POST | `/api/v1/stt/jobs` | Tạo job cho file âm thanh dài (`?model=qwen3-asr\|whisper-en&refine=true`), trả `202` |
 | GET | `/api/v1/stt/jobs/{jobId}` | Xem tiến độ (`0.0..1.0`), các đoạn đã xong và văn bản cuối cùng |
 | DELETE | `/api/v1/stt/jobs/{jobId}` | Hủy job đang chạy (bật cờ abort trong C++) và xóa file tạm |
-| POST | `/api/v1/stt/transcriptions` | Nhận dạng đồng bộ một file WAV 16 kHz 16-bit mono ngắn, trả `{"text","sampleRate","durationMs"}` |
+| POST | `/api/v1/stt/transcriptions` | Nhận dạng đồng bộ một file WAV 16 kHz 16-bit mono dài tối đa `stt.max-utterance-seconds` (60 giây), trả `{"text","sampleRate","durationMs"}`. Dài hơn thì dùng `/jobs` |
 
-Đường dẫn cũ `/api/stt/...` vẫn dùng được như bí danh cho client viết trước khi có `/api/v1`; client mới nên dùng `/api/v1`. `/api/health` không còn: dùng `/actuator/health`.
+Đường dẫn cũ `/api/stt/...` vẫn dùng được như bí danh cho client viết trước khi có `/api/v1`, nhưng đã deprecated: phản hồi kèm `Deprecation` và `Link: <đường dẫn /api/v1 tương ứng>; rel="successor-version"`. Chưa có ngày gỡ bỏ. Client mới nên dùng `/api/v1`. `/api/health` không còn: dùng `/actuator/health`.
 
 ```bash
 curl -F "file=@meeting.m4a" "http://localhost:8080/api/v1/stt/jobs?model=qwen3-asr&refine=true"
@@ -103,7 +103,7 @@ curl http://localhost:8080/api/v1/stt/jobs/<jobId>
 curl -F "file=@sample.wav" http://localhost:8080/api/v1/stt/transcriptions
 ```
 
-Lỗi trả theo RFC 9457 (`application/problem+json`): `400` file sai định dạng hoặc sai sample rate, `413` file quá lớn, `415` không phải multipart, `503` khi model lỗi, hoặc kèm `Retry-After` khi mọi slot nhận dạng đang bận.
+Lỗi trả theo RFC 9457 (`application/problem+json`): `400` file sai định dạng, sai sample rate hoặc quá dài cho `/transcriptions`, `413` file quá lớn, `415` không phải multipart, `503` khi model lỗi, hoặc kèm `Retry-After` khi mọi slot nhận dạng đang bận.
 
 ### Vận hành (Actuator)
 
@@ -208,9 +208,10 @@ Cấu hình trong `application.yml` (hoặc biến môi trường dạng `STT_PO
 
 ```
 node tools/load-test.mjs localhost:8080 6 25 tiengnoi.wav
+node tools/load-test.mjs localhost:8080 6 40 tiengnoi.wav --end-every=8 --api-key=khoa-cua-ban
 ```
 
-Đối số: `host:port`, số kết nối, số giây, và file WAV 16 kHz mono 16-bit (tùy chọn). **Luôn đo bằng file tiếng nói thật.** Không có file thì tool phát im lặng, và im lặng giải mã nhanh hơn nhiều lần tiếng nói nên cho con số quá lạc quan.
+Đối số: `host:port`, số kết nối, số giây, và file WAV 16 kHz mono 16-bit (tùy chọn). `--end-every=<giây>` gửi `end` định kỳ: **bắt buộc với engine `jni`**, vì nó chỉ trả văn bản sau `end`; thiếu cờ này công cụ chỉ nhận một kết quả ở cuối và phân vị `lagMs` không có ý nghĩa (công cụ sẽ nhắc). `--api-key=<khóa>` dùng khi máy chủ bật xác thực. **Luôn đo bằng file tiếng nói thật.** Không có file thì tool phát im lặng, và im lặng giải mã nhanh hơn nhiều lần tiếng nói nên cho con số quá lạc quan.
 
 Tăng dần số kết nối đến khi p95 của `lagMs` vượt mức bạn chấp nhận được (ví dụ 2 giây), rồi đặt `stt.pool.max-sessions` thấp hơn mức đó một chút. Quá mức đó, server vẫn tự bảo vệ: client tụt quá `max-buffered-audio` bị ngắt, nhưng đặt đúng `max-sessions` thì người dùng thừa được từ chối ngay từ cửa (`capacity_exceeded`) thay vì bị ngắt giữa chừng. Khi đo, tắt hết tiến trình nền nặng, nếu không số đo sai nhiều lần. Chưa có số đo cho engine `jni` trên board G520; số đo cũ với Vosk không còn áp dụng.
 
@@ -232,6 +233,8 @@ Quy ước engine phải giữ:
 - Không sửa `websocket/` hay `api/` khi thêm engine.
 
 ## Kiến trúc
+
+Lý do của từng quyết định và những việc còn nợ: [docs/quyet-dinh-kien-truc.md](docs/quyet-dinh-kien-truc.md).
 
 ```
 com.bocbang.backend
