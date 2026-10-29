@@ -118,7 +118,7 @@ class SpeechWebSocketHandlerTest {
         handler.handleTextMessage(webSocket, new TextMessage("{\"type\":\"end\"}"));
 
         List<String> sent = sentPayloads(webSocket, 2);
-        assertThat(sent.get(1)).contains("\"code\":\"recognition_failed\"").contains("timed out");
+        assertThat(sent.get(1)).contains("\"code\":\"recognition_failed\"").doesNotContain("300000").doesNotContain("Native model");
         verify(webSocket, never()).close(any(CloseStatus.class));
     }
 
