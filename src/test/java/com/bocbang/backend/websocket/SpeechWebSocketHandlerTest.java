@@ -4,19 +4,25 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.awaitility.Awaitility.await;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.timeout;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 import com.bocbang.backend.TestSettings;
 import com.bocbang.backend.runtime.InferenceExecutor;
+import com.bocbang.backend.runtime.RuntimeProperties;
 import com.bocbang.backend.runtime.SessionLimiter;
 import com.bocbang.backend.stt.FakeSpeechToTextEngine;
-import com.bocbang.backend.stt.SttProperties;
+import com.bocbang.backend.stt.SpeechRecognitionException;
+import com.bocbang.backend.stt.SpeechSession;
+import com.bocbang.backend.stt.SpeechToTextEngine;
+import com.bocbang.backend.stt.TranscriptEvent;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import java.net.URI;
 import java.util.HashMap;
 import java.util.List;
+import java.util.Optional;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import org.junit.jupiter.api.AfterEach;
@@ -41,7 +47,7 @@ class SpeechWebSocketHandlerTest {
 
     @Test
     void sendsReadyThenPartialAndFinalTranscripts() throws Exception {
-        SpeechWebSocketHandler handler = handler(TestSettings.properties());
+        SpeechWebSocketHandler handler = handler(TestSettings.runtime());
         WebSocketSession webSocket = webSocket("ws://localhost/ws/stt?sampleRate=16000");
 
         handler.afterConnectionEstablished(webSocket);
@@ -57,7 +63,7 @@ class SpeechWebSocketHandlerTest {
 
     @Test
     void closesTheRecognizerAndFreesTheSlotWhenTheConnectionCloses() throws Exception {
-        SpeechWebSocketHandler handler = handler(TestSettings.properties());
+        SpeechWebSocketHandler handler = handler(TestSettings.runtime());
         WebSocketSession webSocket = webSocket("ws://localhost/ws/stt");
         handler.afterConnectionEstablished(webSocket);
         assertThat(limiter.active()).isEqualTo(1);
@@ -70,7 +76,7 @@ class SpeechWebSocketHandlerTest {
 
     @Test
     void keepsTheSlotTakenUntilTheRecognizerIsReallyClosed() throws Exception {
-        SpeechWebSocketHandler handler = handler(TestSettings.properties());
+        SpeechWebSocketHandler handler = handler(TestSettings.runtime());
         WebSocketSession webSocket = webSocket("ws://localhost/ws/stt");
         handler.afterConnectionEstablished(webSocket);
         CountDownLatch release = blockWorkers(2);
@@ -85,9 +91,52 @@ class SpeechWebSocketHandlerTest {
     }
 
     @Test
-    void rejectsSampleRateOutsideSupportedRange() throws Exception {
-        SpeechWebSocketHandler handler = handler(TestSettings.properties());
+    void tellsTheClientAndKeepsTheConnectionWhenTheEngineRejectsAudio() throws Exception {
+        SpeechToTextEngine strict =
+                strictEngine(new IllegalArgumentException("Utterance is longer than the 60 s limit"), null);
+        SpeechWebSocketHandler handler = handler(strict, TestSettings.runtime());
+        WebSocketSession webSocket = webSocket("ws://localhost/ws/stt");
+        handler.afterConnectionEstablished(webSocket);
+
+        handler.handleBinaryMessage(webSocket, new BinaryMessage(new byte[] {1, 0}));
+        handler.handleTextMessage(webSocket, new TextMessage("{\"type\":\"end\"}"));
+
+        List<String> sent = sentPayloads(webSocket, 3);
+        assertThat(sent.get(1)).contains("\"code\":\"invalid_audio\"").contains("60 s limit").contains("more often");
+        assertThat(sent.get(2)).contains("\"type\":\"final\"").contains("\"text\":\"kept going\"");
+        verify(webSocket, never()).close(any(CloseStatus.class));
+    }
+
+    @Test
+    void reportsAFailedTranscriptAsAnErrorAndKeepsTheConnection() throws Exception {
+        SpeechToTextEngine strict =
+                strictEngine(null, new SpeechRecognitionException("Native model timed out after 300000 ms"));
+        SpeechWebSocketHandler handler = handler(strict, TestSettings.runtime());
+        WebSocketSession webSocket = webSocket("ws://localhost/ws/stt");
+        handler.afterConnectionEstablished(webSocket);
+
+        handler.handleTextMessage(webSocket, new TextMessage("{\"type\":\"end\"}"));
+
+        List<String> sent = sentPayloads(webSocket, 2);
+        assertThat(sent.get(1)).contains("\"code\":\"recognition_failed\"").contains("timed out");
+        verify(webSocket, never()).close(any(CloseStatus.class));
+    }
+
+    @Test
+    void rejectsSampleRateFarBelowTheAudioRange() throws Exception {
+        SpeechWebSocketHandler handler = handler(TestSettings.runtime());
         WebSocketSession webSocket = webSocket("ws://localhost/ws/stt?sampleRate=100");
+
+        handler.afterConnectionEstablished(webSocket);
+
+        assertThat(sentPayloads(webSocket, 1).get(0)).contains("\"code\":\"invalid_sample_rate\"");
+        assertThat(limiter.active()).isZero();
+    }
+
+    @Test
+    void rejectsSampleRateOtherThanModelRate() throws Exception {
+        SpeechWebSocketHandler handler = handler(TestSettings.runtime());
+        WebSocketSession webSocket = webSocket("ws://localhost/ws/stt?sampleRate=8000");
 
         handler.afterConnectionEstablished(webSocket);
 
@@ -101,7 +150,7 @@ class SpeechWebSocketHandlerTest {
 
     @Test
     void reportsOddLengthPcmFrameAsError() throws Exception {
-        SpeechWebSocketHandler handler = handler(TestSettings.properties());
+        SpeechWebSocketHandler handler = handler(TestSettings.runtime());
         WebSocketSession webSocket = webSocket("ws://localhost/ws/stt");
         handler.afterConnectionEstablished(webSocket);
 
@@ -115,7 +164,7 @@ class SpeechWebSocketHandlerTest {
 
     @Test
     void refusesAConnectionOverCapacityWithServiceOverload() throws Exception {
-        SpeechWebSocketHandler handler = handler(TestSettings.properties());
+        SpeechWebSocketHandler handler = handler(TestSettings.runtime());
         handler.afterConnectionEstablished(webSocket("ws://localhost/ws/stt"));
         WebSocketSession second = webSocket("ws://localhost/ws/stt");
 
@@ -131,7 +180,7 @@ class SpeechWebSocketHandlerTest {
 
     @Test
     void closesTheConnectionWhenTheClientOutrunsTheServer() throws Exception {
-        SpeechWebSocketHandler handler = handler(TestSettings.properties("session.max-buffered-audio", "1ms"));
+        SpeechWebSocketHandler handler = handler(TestSettings.runtime("session.max-buffered-audio", "1ms"));
         WebSocketSession webSocket = webSocket("ws://localhost/ws/stt?sampleRate=16000");
         handler.afterConnectionEstablished(webSocket);
 
@@ -143,8 +192,42 @@ class SpeechWebSocketHandlerTest {
         assertThat(status.getValue().getCode()).isEqualTo(CloseStatus.SERVICE_OVERLOAD.getCode());
     }
 
-    private SpeechWebSocketHandler handler(SttProperties properties) {
-        return new SpeechWebSocketHandler(engine, properties, limiter, executor);
+    private SpeechWebSocketHandler handler(RuntimeProperties runtime) {
+        return handler(engine, runtime);
+    }
+
+    private SpeechWebSocketHandler handler(SpeechToTextEngine withEngine, RuntimeProperties runtime) {
+        return new SpeechWebSocketHandler(withEngine, TestSettings.properties(), runtime, limiter, executor);
+    }
+
+    /** An engine whose sessions refuse audio or fail the transcript with the given exceptions, when not null. */
+    private static SpeechToTextEngine strictEngine(RuntimeException onAccept, RuntimeException onFinish) {
+        return new FakeSpeechToTextEngine("unused") {
+            @Override
+            public SpeechSession openSession(int sampleRate) {
+                return new SpeechSession() {
+                    @Override
+                    public Optional<TranscriptEvent> accept(byte[] pcm, int length) {
+                        if (onAccept != null) {
+                            throw onAccept;
+                        }
+                        return Optional.empty();
+                    }
+
+                    @Override
+                    public TranscriptEvent finish() {
+                        if (onFinish != null) {
+                            throw onFinish;
+                        }
+                        return TranscriptEvent.finalResult("kept going");
+                    }
+
+                    @Override
+                    public void close() {
+                    }
+                };
+            }
+        };
     }
 
     /** Occupies every inference thread so queued work, such as closing a session, cannot start. */

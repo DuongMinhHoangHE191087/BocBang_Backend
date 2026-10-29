@@ -1,9 +1,10 @@
 package com.bocbang.backend.websocket;
 
 import com.bocbang.backend.runtime.InferenceExecutor;
+import com.bocbang.backend.runtime.RuntimeProperties;
 import com.bocbang.backend.runtime.SessionLimiter;
 import com.bocbang.backend.runtime.SessionPipeline;
-import com.bocbang.backend.stt.SampleRates;
+import com.bocbang.backend.stt.SpeechRecognitionException;
 import com.bocbang.backend.stt.SpeechSession;
 import com.bocbang.backend.stt.SpeechToTextEngine;
 import com.bocbang.backend.stt.SttProperties;
@@ -31,12 +32,13 @@ import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.ObjectMapper;
 
 /**
- * Streaming speech-to-text over WebSocket at {@code /ws/stt?sampleRate=16000}.
+ * Speech-to-text over WebSocket at {@code /ws/stt?sampleRate=16000}.
  *
- * <p>Client to server: binary frames of 16-bit little-endian mono PCM; text frame {@code {"type":"end"}}
- * to finish the current utterance.
- * <p>Server to client (JSON text): {@code ready} once on connect, then {@code partial} and {@code final}
- * transcripts (each with the server-side {@code lagMs}), or {@code error} with a machine-readable {@code code}.
+ * <p>Client to server: binary frames of 16-bit little-endian mono PCM at the model's sample rate;
+ * text frame {@code {"type":"end"}} to finish the current utterance.
+ * <p>Server to client (JSON text): {@code ready} once on connect, {@code final} after each {@code end}, or
+ * {@code error} with a machine-readable {@code code}. Engines that support streaming may also send
+ * {@code partial}. Every transcript carries the server-side {@code lagMs}.
  *
  * <p>This class only moves messages. Recognition runs on the shared inference threads through a
  * {@link SessionPipeline}, so a connection never blocks a web server thread.
@@ -52,14 +54,16 @@ public class SpeechWebSocketHandler extends AbstractWebSocketHandler implements 
 
     private final SpeechToTextEngine engine;
     private final SttProperties properties;
+    private final RuntimeProperties runtime;
     private final SessionLimiter limiter;
     private final InferenceExecutor executor;
     private final Set<Connection> connections = ConcurrentHashMap.newKeySet();
 
-    public SpeechWebSocketHandler(SpeechToTextEngine engine, SttProperties properties, SessionLimiter limiter,
-            InferenceExecutor executor) {
+    public SpeechWebSocketHandler(SpeechToTextEngine engine, SttProperties properties, RuntimeProperties runtime,
+            SessionLimiter limiter, InferenceExecutor executor) {
         this.engine = engine;
         this.properties = properties;
+        this.runtime = runtime;
         this.limiter = limiter;
         this.executor = executor;
     }
@@ -88,12 +92,12 @@ public class SpeechWebSocketHandler extends AbstractWebSocketHandler implements 
             return;
         }
 
-        SttProperties.WebSocket settings = properties.websocket();
+        RuntimeProperties.WebSocket settings = runtime.websocket();
         WebSocketSession socket = new ConcurrentWebSocketSessionDecorator(
                 webSocket, (int) settings.sendTimeout().toMillis(), settings.sendBufferBytes());
         SessionPipeline pipeline = new SessionPipeline(speech, executor, transcriptListener(socket, permit.get()),
-                audioBytes(sampleRate, properties.session().maxBufferedAudio().toMillis()),
-                (int) audioBytes(sampleRate, properties.session().maxBatchAudio().toMillis()));
+                audioBytes(sampleRate, runtime.session().maxBufferedAudio().toMillis()),
+                (int) audioBytes(sampleRate, runtime.session().maxBatchAudio().toMillis()));
         Connection connection = new Connection(socket, pipeline);
         webSocket.getAttributes().put(CONNECTION_ATTRIBUTE, connection);
         connections.add(connection);
@@ -177,6 +181,16 @@ public class SpeechWebSocketHandler extends AbstractWebSocketHandler implements 
             }
 
             @Override
+            public void onRejected(RuntimeException cause) {
+                if (cause instanceof SpeechRecognitionException) {
+                    LOG.warn("Recognition failed on session {}: {}", socket.getId(), cause.getMessage());
+                    sendError(socket, "recognition_failed", cause.getMessage());
+                } else {
+                    sendError(socket, "invalid_audio", cause.getMessage() + ", send {\"type\":\"end\"} more often");
+                }
+            }
+
+            @Override
             public void onFailure(Throwable cause) {
                 LOG.error("Recognition failed on session {}", socket.getId(), cause);
                 sendError(socket, "engine_failure", "Recognition failed");
@@ -196,7 +210,7 @@ public class SpeechWebSocketHandler extends AbstractWebSocketHandler implements 
                 .getQueryParams()
                 .getFirst("sampleRate");
         if (value == null) {
-            return properties.defaultSampleRate();
+            return properties.sampleRate();
         }
         int sampleRate;
         try {
@@ -204,9 +218,8 @@ public class SpeechWebSocketHandler extends AbstractWebSocketHandler implements 
         } catch (NumberFormatException e) {
             throw new IllegalArgumentException("sampleRate must be a whole number");
         }
-        if (!SampleRates.isSupported(sampleRate)) {
-            throw new IllegalArgumentException(
-                    "sampleRate must be between " + SampleRates.MIN + " and " + SampleRates.MAX);
+        if (sampleRate != properties.sampleRate()) {
+            throw new IllegalArgumentException("sampleRate must be " + properties.sampleRate());
         }
         return sampleRate;
     }

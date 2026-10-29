@@ -1,8 +1,8 @@
 package com.bocbang.backend.stt.mock;
 
+import com.bocbang.backend.runtime.RuntimeProperties;
 import com.bocbang.backend.stt.SpeechSession;
 import com.bocbang.backend.stt.SpeechToTextEngine;
-import com.bocbang.backend.stt.SttProperties;
 import com.bocbang.backend.stt.TranscriptEvent;
 import java.time.Duration;
 import java.util.Arrays;
@@ -28,12 +28,13 @@ public class MockSpeechEngine implements SpeechToTextEngine {
             "khi mô hình thật sẵn sàng chỉ cần thay engine này là xong");
 
     private static final int BYTES_PER_SAMPLE = 2;
+    private static final int SAMPLES_PER_SECOND = 16000;
     private static final int WORD_MILLIS = 250;
 
     private final Duration chunkLatency;
     private final Duration segment;
 
-    public MockSpeechEngine(SttProperties properties) {
+    public MockSpeechEngine(RuntimeProperties properties) {
         this.chunkLatency = properties.mock().chunkLatency();
         this.segment = properties.mock().segment();
     }
@@ -41,6 +42,22 @@ public class MockSpeechEngine implements SpeechToTextEngine {
     @Override
     public String name() {
         return "mock";
+    }
+
+    @Override
+    public String defaultModel() {
+        return "mock";
+    }
+
+    @Override
+    public List<String> models() {
+        return List.of("mock");
+    }
+
+    /** One scripted word per quarter second of the 16 kHz samples, like a streaming session would produce. */
+    @Override
+    public String transcribe(String model, float[] samples) {
+        return words(0, (int) ((long) samples.length * 1000 / SAMPLES_PER_SECOND / WORD_MILLIS));
     }
 
     /** The mock costs almost nothing, so demos can show many streams per worker. */
@@ -75,7 +92,7 @@ public class MockSpeechEngine implements SpeechToTextEngine {
             if (segmentBytes >= bytesPerSegment) {
                 return Optional.of(commitSentence());
             }
-            String partial = words((int) (segmentBytes / bytesPerWord));
+            String partial = words(sentence, (int) (segmentBytes / bytesPerWord));
             if (partial.equals(lastPartial)) {
                 return Optional.empty();
             }
@@ -113,9 +130,10 @@ public class MockSpeechEngine implements SpeechToTextEngine {
             return TranscriptEvent.finalResult(text);
         }
 
-        private String words(int count) {
-            String[] all = SENTENCES.get(sentence % SENTENCES.size()).split(" ");
-            return String.join(" ", Arrays.copyOf(all, Math.min(count, all.length)));
-        }
+    }
+
+    private static String words(int sentence, int count) {
+        String[] all = SENTENCES.get(sentence % SENTENCES.size()).split(" ");
+        return String.join(" ", Arrays.copyOf(all, Math.min(count, all.length)));
     }
 }

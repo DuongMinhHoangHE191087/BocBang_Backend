@@ -18,12 +18,12 @@ class MockSpeechEngineTest extends SpeechToTextEngineContract {
 
     @Override
     protected SpeechToTextEngine engine() {
-        return new MockSpeechEngine(TestSettings.properties("mock.segment", "1s"));
+        return new MockSpeechEngine(TestSettings.runtime("mock.segment", "1s"));
     }
 
     @Test
     void growsAPartialSentenceThenCommitsItAsFinalAtTheEndOfTheSegment() {
-        MockSpeechEngine engine = new MockSpeechEngine(TestSettings.properties("mock.segment", "1s"));
+        MockSpeechEngine engine = new MockSpeechEngine(TestSettings.runtime("mock.segment", "1s"));
         List<TranscriptEvent> events = new ArrayList<>();
         try (SpeechSession session = engine.openSession(16000)) {
             for (int chunk = 0; chunk < 4; chunk++) {
@@ -54,7 +54,7 @@ class MockSpeechEngineTest extends SpeechToTextEngineContract {
 
     @Test
     void reportsAPartialOnlyWhenItsTextChanged() {
-        MockSpeechEngine engine = new MockSpeechEngine(TestSettings.properties("mock.segment", "10s"));
+        MockSpeechEngine engine = new MockSpeechEngine(TestSettings.runtime("mock.segment", "10s"));
         try (SpeechSession session = engine.openSession(16000)) {
             session.accept(new byte[16000 * 2 / 4], 16000 * 2 / 4);
 
@@ -66,7 +66,7 @@ class MockSpeechEngineTest extends SpeechToTextEngineContract {
 
     @Test
     void simulatesProcessingTimePerChunkWhenConfigured() {
-        MockSpeechEngine engine = new MockSpeechEngine(TestSettings.properties("mock.chunk-latency", "40ms"));
+        MockSpeechEngine engine = new MockSpeechEngine(TestSettings.runtime("mock.chunk-latency", "40ms"));
         try (SpeechSession session = engine.openSession(16000)) {
             long started = System.nanoTime();
 

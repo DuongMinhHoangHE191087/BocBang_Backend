@@ -1,6 +1,7 @@
 package com.bocbang.backend.api;
 
 import com.bocbang.backend.runtime.CapacityExceededException;
+import com.bocbang.backend.stt.SpeechRecognitionException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.http.HttpHeaders;
@@ -32,6 +33,11 @@ public class ApiExceptionHandler extends ResponseEntityExceptionHandler {
                 .header(HttpHeaders.RETRY_AFTER, RETRY_AFTER_SECONDS)
                 .contentType(MediaType.APPLICATION_PROBLEM_JSON)
                 .body(problem);
+    }
+
+    @ExceptionHandler(SpeechRecognitionException.class)
+    public ProblemDetail handleRecognitionFailure(SpeechRecognitionException e) {
+        return ProblemDetail.forStatusAndDetail(HttpStatus.SERVICE_UNAVAILABLE, e.getMessage());
     }
 
     @ExceptionHandler(Exception.class)

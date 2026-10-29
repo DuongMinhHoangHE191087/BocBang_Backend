@@ -1,5 +1,6 @@
 package com.bocbang.backend.runtime;
 
+import com.bocbang.backend.stt.SpeechRecognitionException;
 import com.bocbang.backend.stt.SpeechSession;
 import com.bocbang.backend.stt.TranscriptEvent;
 import java.util.ArrayList;
@@ -26,6 +27,13 @@ public final class SessionPipeline {
 
         /** The engine failed. The pipeline stops feeding the session; the owner should close it. */
         void onFailure(Throwable cause);
+
+        /**
+         * The engine refused one input, such as audio past its utterance limit, or could not produce one transcript.
+         * The session is still usable, so the pipeline keeps feeding it.
+         */
+        default void onRejected(RuntimeException cause) {
+        }
 
         /** The session has been closed and nothing will use it again, so what it held can be given back. */
         default void onClosed() {
@@ -173,6 +181,8 @@ public final class SessionPipeline {
         try {
             session.accept(pcm, pcm.length)
                     .ifPresent(event -> listener.onTranscript(event, millisSince(first.enqueuedNanos())));
+        } catch (IllegalArgumentException | SpeechRecognitionException e) {
+            notifyRejected(e);
         } catch (RuntimeException | Error e) {
             // A native engine fails with Errors (UnsatisfiedLinkError, OutOfMemoryError); the client must still hear it.
             fail(e);
@@ -186,8 +196,18 @@ public final class SessionPipeline {
         try {
             TranscriptEvent result = session.finish();
             listener.onTranscript(result, millisSince(finish.enqueuedNanos()));
+        } catch (IllegalArgumentException | SpeechRecognitionException e) {
+            notifyRejected(e);
         } catch (RuntimeException | Error e) {
             fail(e);
+        }
+    }
+
+    private void notifyRejected(RuntimeException cause) {
+        try {
+            listener.onRejected(cause);
+        } catch (RuntimeException e) {
+            // The listener is the connection; if it cannot take the news it is already closed.
         }
     }
 

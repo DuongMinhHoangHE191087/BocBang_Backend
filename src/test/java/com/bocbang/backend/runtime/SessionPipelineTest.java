@@ -3,6 +3,7 @@ package com.bocbang.backend.runtime;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.awaitility.Awaitility.await;
 
+import com.bocbang.backend.stt.SpeechRecognitionException;
 import com.bocbang.backend.stt.TranscriptEvent;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import java.nio.ByteBuffer;
@@ -252,6 +253,36 @@ class SessionPipelineTest {
         assertThat(session.closeCount.get()).isEqualTo(1);
         assertThat(listener.closed.get()).isEqualTo(1);
         assertThat(listener.failures).hasSize(1);
+    }
+
+    @Test
+    void keepsFeedingTheSessionAfterTheEngineRejectsOneInput() {
+        session.failure = new IllegalArgumentException("Utterance is longer than the 60 s limit");
+        SessionPipeline pipeline = new SessionPipeline(session, executor, listener, MAX_BUFFERED, MAX_BATCH);
+
+        pipeline.offer(new byte[10]);
+        await().atMost(5, TimeUnit.SECONDS).until(() -> listener.rejections.size() == 1);
+        session.failure = null;
+        pipeline.offer(new byte[10]);
+
+        await().atMost(5, TimeUnit.SECONDS).until(() -> session.receivedBytes() == 10);
+        assertThat(listener.failures).as("a rejected input is not a failed session").isEmpty();
+        assertThat(listener.rejections.get(0)).hasMessageContaining("60 s limit");
+    }
+
+    @Test
+    void reportsAFailedTranscriptAsRejectedAndStaysUsable() {
+        session.finishFailure = new SpeechRecognitionException("Native model timed out after 300000 ms");
+        SessionPipeline pipeline = new SessionPipeline(session, executor, listener, MAX_BUFFERED, MAX_BATCH);
+
+        pipeline.finish();
+        await().atMost(5, TimeUnit.SECONDS).until(() -> listener.rejections.size() == 1);
+        session.finishFailure = null;
+        pipeline.finish();
+
+        await().atMost(5, TimeUnit.SECONDS).until(() -> listener.events.size() == 1);
+        assertThat(listener.events.get(0)).isEqualTo(TranscriptEvent.finalResult("done"));
+        assertThat(listener.failures).isEmpty();
     }
 
     @Test

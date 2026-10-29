@@ -10,6 +10,7 @@ final class RecordingListener implements SessionPipeline.Listener {
     final List<TranscriptEvent> events = new CopyOnWriteArrayList<>();
     final List<Long> lagsMillis = new CopyOnWriteArrayList<>();
     final List<Throwable> failures = new CopyOnWriteArrayList<>();
+    final List<RuntimeException> rejections = new CopyOnWriteArrayList<>();
     final AtomicInteger closed = new AtomicInteger();
 
     volatile Runnable onClosedHook;
@@ -23,6 +24,11 @@ final class RecordingListener implements SessionPipeline.Listener {
     @Override
     public void onFailure(Throwable cause) {
         failures.add(cause);
+    }
+
+    @Override
+    public void onRejected(RuntimeException cause) {
+        rejections.add(cause);
     }
 
     @Override

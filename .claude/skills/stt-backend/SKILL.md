@@ -1,49 +1,51 @@
 ---
 name: stt-backend
-description: Kiến trúc và protocol của BocBang Backend (Spring Boot 4 + engine nhận dạng cắm được, mặc định Vosk). Dùng khi sửa WebSocket /ws/stt, REST /api/v1/stt, runtime đa luồng, engine nhận dạng giọng nói, web demo, hoặc viết client Android gửi âm thanh.
+description: Kiến trúc và protocol của BocBang Backend (Spring Boot 4 + engine nhận dạng cắm được, mặc định C++ JNI trên board G520, có engine mock). Dùng khi sửa WebSocket /ws/stt, REST /api/v1/stt, runtime đa luồng, engine nhận dạng giọng nói, job file dài, web demo, hoặc viết client Android gửi âm thanh.
 ---
 
 # BocBang STT backend
 
 ## Luồng dữ liệu
 
-1. Client (Android `AudioRecord`, PCM 16-bit mono) mở `ws://<host>:8080/ws/stt?sampleRate=16000`.
+1. Client (Android `AudioRecord`, PCM 16-bit mono 16 kHz) mở `ws://<host>:8080/ws/stt?sampleRate=16000`. Model chỉ nhận đúng `stt.sample-rate`.
 2. Server gửi `{"type":"ready",...,"maxFrameBytes":65536}`. Hết chỗ thì gửi `{"type":"error","code":"capacity_exceeded"}` rồi đóng mã 1013.
-3. Client gửi binary frame PCM mỗi 100 ms. Server trả `partial` khi văn bản thay đổi và `final` khi model kết thúc một câu, mỗi tin có `lagMs`.
-4. Client gửi text `{"type":"end"}` để chốt câu cuối. Server trả `final`.
+3. Client gửi binary frame PCM mỗi 100 ms. Engine streaming (mock) trả `partial` khi văn bản thay đổi; engine `jni` chỉ gom âm thanh. Mỗi tin transcript có `lagMs`.
+4. Client gửi text `{"type":"end"}` để chốt câu. Server chạy model trên cả câu (tối đa `stt.max-utterance-seconds`) và trả `final`.
 
-Lỗi luôn có `code` (`invalid_sample_rate`, `capacity_exceeded`, `overloaded`, `invalid_frame`, `invalid_command`, `engine_failure`). Bảng hành vi đầy đủ trong README.md.
+Lỗi luôn có `code` (`invalid_sample_rate`, `capacity_exceeded`, `overloaded`, `invalid_frame`, `invalid_command`, `invalid_audio`, `recognition_failed`, `engine_failure`). `invalid_audio` và `recognition_failed` giữ kết nối. Bảng hành vi đầy đủ trong README.md.
 
 ## Đường đi của một frame
 
-`SpeechWebSocketHandler` (thread web) → `SessionPipeline.offer` (hàng đợi riêng của kết nối) → `InferenceExecutor` (bộ thread cố định) → `SpeechSession.accept` → `Listener` gửi `partial/final` qua `ConcurrentWebSocketSessionDecorator`. REST upload file đi qua cùng `SessionLimiter` và `InferenceExecutor` (`TranscriptionService`).
+`SpeechWebSocketHandler` (thread web) → `SessionPipeline.offer` (hàng đợi riêng của kết nối) → `InferenceExecutor` (bộ thread cố định) → `SpeechSession.accept` / `finish` → `Listener` gửi `partial/final` qua `ConcurrentWebSocketSessionDecorator`. Với engine `jni`, `finish` gọi `JniSpeechEngine.transcribe` qua `CpuExecutionGate` (mọi lời gọi native xếp hàng tuần tự). REST WAV ngắn đi qua cùng `SessionLimiter` và `InferenceExecutor` (`TranscriptionService`); file dài chạy nền trong `TranscriptionJobService`.
 
 ## Chỗ cần sửa khi làm việc với từng phần
 
 - Thêm model khác: implement `SpeechToTextEngine` và `SpeechSession` trong package `stt/<tên>/`, `@Component` + `@ConditionalOnProperty(prefix = "stt", name = "engine", havingValue = "<tên>")`, thêm test kế thừa `SpeechToTextEngineContract`. Không sửa `websocket/` hay `api/`.
 - Đổi protocol WebSocket: `websocket/SpeechWebSocketHandler.java`, cập nhật README.md, `SttEndToEndTest`, `tools/load-test.mjs` nếu đổi tin nhắn, và `static/app.js`.
-- Đổi hành vi đa luồng, hàng đợi, backpressure: `runtime/SessionPipeline.java` (có `SessionPipelineTest`).
-- Giới hạn tải và cấu hình: `stt/SttProperties.java`, `application.yml`.
-- Đổi REST: `api/SttController.java`, lỗi trong `api/ApiExceptionHandler.java` (RFC 9457). Đường dẫn có tiền tố `/api/v1`.
-- Đổi cách đọc file: `stt/TranscriptionService.java` (chỉ nhận WAV 16-bit PCM mono).
+- Đổi hành vi đa luồng, hàng đợi, backpressure, phân loại lỗi engine: `runtime/SessionPipeline.java` (có `SessionPipelineTest`).
+- Giới hạn tải, chọn engine, WebSocket: `runtime/RuntimeProperties.java`, `application.yml`. Model, thư viện native, VAD, refiner, job: `stt/SttProperties.java`. Hai record cùng tiền tố `stt`; test dựng bằng `TestSettings.runtime(...)` và `TestSettings.properties(...)`.
+- Đổi REST: `api/SttController.java` (phục vụ cả `/api/v1/stt` và `/api/stt` cũ), lỗi trong `api/ApiExceptionHandler.java` (RFC 9457).
+- Đổi cách đọc file WAV ngắn: `stt/TranscriptionService.java` (chỉ nhận WAV 16-bit PCM mono đúng `stt.sample-rate`). File dài: `stt/TranscriptionJobService.java`.
+- Phần C++ và JNI: `native/`, `stt/jni/`; cách biên dịch trong README.md.
 - Web demo: `src/main/resources/static/` (`index.html`, `app.css`, `app.js`, `pcm-worklet.js`), không dùng CDN hay bước build.
-- Chọn engine: `STT_ENGINE=vosk|mock`. Đường dẫn model Vosk: `stt.vosk.model-path` hoặc `STT_VOSK_MODEL_PATH`.
+- Chọn engine: `STT_ENGINE=jni|mock` (mặc định `jni`). Model: `stt.models.*`, thư mục model `STT_MODEL_DIR`.
 
 ## Ràng buộc đã biết
 
 - `SpeechSession` không thread-safe. `SessionPipeline` bảo đảm một thread tại một thời điểm, theo đúng thứ tự đến, nhưng các lần gọi có thể đến từ các worker khác nhau (không dùng `ThreadLocal`).
-- Model Vosk được nạp một lần khi khởi động. Nếu thiếu thư mục model, server dừng ngay với thông báo đường dẫn (dùng `STT_ENGINE=mock` để chạy khi chưa có model).
-- Số luồng tối đa mặc định = số worker nhân `SpeechToTextEngine.sessionsPerWorker()` (Vosk 1, mock 4). Vosk thật tốn khoảng 0.6 đến 1.1 nhân mỗi luồng với tiếng nói liên tục, nên phải đo bằng `tools/load-test.mjs` với file tiếng nói thật (im lặng nhanh gấp ~10 lần, cho số sai) và chỉ số `stt.queue.wait`, rồi đặt `stt.pool.max-sessions`.
+- `JniSpeechEngine` giữ tối đa một model ASR trong RAM native, nạp khi cần; thiếu file model thì lỗi lúc nhận dạng, không phải lúc khởi động. Thiếu cấu hình `stt.models` thì server không khởi động (dùng `STT_ENGINE=mock` khi chưa có model).
+- Số luồng tối đa mặc định = số worker nhân `SpeechToTextEngine.sessionsPerWorker()` (jni 1, mock 4). `CpuExecutionGate` chạy native từng cái một nên throughput không tăng theo số worker; phải đo bằng `tools/load-test.mjs` với file tiếng nói thật (im lặng nhanh hơn nhiều, cho số sai) và chỉ số `stt.queue.wait`, rồi đặt `stt.pool.max-sessions`.
 - Slot của luồng WebSocket (`SessionLimiter.Permit`) chỉ được trả khi `SessionPipeline.Listener.onClosed` chạy, tức recognizer đã đóng thật, không phải lúc ngắt kết nối. Đừng trả permit ở handler.
-- `SessionPipeline` bắt cả `Error` từ engine (native hay ném `UnsatisfiedLinkError`) và báo qua `onFailure`. Nhiều `end` liên tiếp không có audio xen giữa gộp thành một `final`.
-- REST upload bọc session trong `GuardedSession`: thread request bị ngắt không được đóng session khi một thread suy luận còn đang ở trong engine. Tần số lấy mẫu của WAV phải qua `SampleRates` như WebSocket.
+- `SessionPipeline` phân loại lỗi engine: `IllegalArgumentException` và `SpeechRecognitionException` gọi `onRejected` (giữ phiên); mọi lỗi khác, kể cả `Error` như `UnsatisfiedLinkError`, gọi `onFailure` (đóng phiên). Nhiều `end` liên tiếp không có audio xen giữa gộp thành một `final`.
+- `max-buffered-audio` mặc định 30s vì `finish()` của engine `jni` có thể mất nhiều giây, trong lúc đó client vẫn gửi câu kế tiếp.
+- REST upload bọc session trong `GuardedSession`: thread request bị ngắt không được đóng session khi một thread suy luận còn đang ở trong engine. Tần số lấy mẫu của WAV phải bằng `stt.sample-rate`.
 - Health: indicator `stt` báo `BUSY` khi đầy slot. `application.yml` xếp `BUSY` dưới `UP` cho `/actuator/health` (vẫn 200) và trên `UP` cho nhóm readiness (503). `InferenceExecutor` nhận `SpeechToTextEngine` làm tham số để bị hủy trước engine.
 - Container WebSocket mặc định chỉ nhận frame nhị phân 8 KB; `WebSocketConfig` nâng lên `stt.websocket.max-frame-bytes`.
-- Máy chủ chỉ chạy trên PC/server. App Android là client, không chạy Spring Boot trong APK.
+- Máy chủ chạy trên board/PC/server. App Android là client, không chạy Spring Boot trong APK.
 - `AudioSystem.getAudioInputStream` cần luồng hỗ trợ mark/reset, nên `TranscriptionService` bọc `BufferedInputStream`.
 
 ## Kiểm tra
 
-- Test không cần model: `test --no-daemon` qua `~/.claude/scripts/jvm-ondemand.ps1` (xem CLAUDE.md của dự án). Gồm `SttEndToEndTest` chạy cả server thật trên cổng ngẫu nhiên.
-- Test với model thật tự bật khi có thư mục `models/vosk-model-small-vn-0.4`.
+- Test không cần model: `test --no-daemon` qua `~/.claude/scripts/jvm-ondemand.ps1` (xem CLAUDE.md của dự án). Gồm `SttEndToEndTest` chạy cả server thật trên cổng ngẫu nhiên với engine giả.
+- `JniSpeechEngineTest` tự bật khi đã `./scripts/build-native.sh host` và có model.
 - Thử tay: chạy server với `STT_ENGINE=mock`, mở `http://localhost:8080/`, hoặc `node tools/load-test.mjs`.

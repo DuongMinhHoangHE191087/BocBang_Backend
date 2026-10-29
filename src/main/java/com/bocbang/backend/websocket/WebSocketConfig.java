@@ -1,6 +1,6 @@
 package com.bocbang.backend.websocket;
 
-import com.bocbang.backend.stt.SttProperties;
+import com.bocbang.backend.runtime.RuntimeProperties;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.web.socket.config.annotation.EnableWebSocket;
@@ -16,9 +16,9 @@ public class WebSocketConfig implements WebSocketConfigurer {
     private static final int MAX_TEXT_FRAME_BYTES = 4096;
 
     private final SpeechWebSocketHandler speechHandler;
-    private final SttProperties.WebSocket settings;
+    private final RuntimeProperties.WebSocket settings;
 
-    public WebSocketConfig(SpeechWebSocketHandler speechHandler, SttProperties properties) {
+    public WebSocketConfig(SpeechWebSocketHandler speechHandler, RuntimeProperties properties) {
         this.speechHandler = speechHandler;
         this.settings = properties.websocket();
     }

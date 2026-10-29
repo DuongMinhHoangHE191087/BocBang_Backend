@@ -26,6 +26,8 @@ final class RecordingSession implements SpeechSession {
     /** Thrown from {@link #accept} like a failure, but as an Error, the way a broken native library behaves. */
     volatile Error error;
     volatile Runnable onAccept;
+    /** Thrown from {@link #finish} while set. */
+    volatile RuntimeException finishFailure;
 
     private final AtomicInteger busy = new AtomicInteger();
     private final ByteArrayOutputStream received = new ByteArrayOutputStream();
@@ -60,6 +62,9 @@ final class RecordingSession implements SpeechSession {
     public TranscriptEvent finish() {
         enter();
         try {
+            if (finishFailure != null) {
+                throw finishFailure;
+            }
             return TranscriptEvent.finalResult("done");
         } finally {
             busy.decrementAndGet();

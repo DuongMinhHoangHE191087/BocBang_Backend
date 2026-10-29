@@ -130,6 +130,19 @@ class SttEndToEndTest {
     }
 
     @Test
+    void keepsTheUnversionedPathsForClientsBuiltBeforeV1() throws Exception {
+        HttpResponse<String> legacy = get("/api/stt/status");
+        HttpResponse<String> current = get("/api/v1/stt/status");
+
+        assertThat(legacy.statusCode()).isEqualTo(200);
+        assertThat(legacy.body()).contains("\"engine\":\"fake\"");
+        assertThat(current.body())
+                .contains("\"defaultModel\":\"qwen3-asr\"")
+                .contains("\"sampleRate\":16000")
+                .contains("\"jobsPath\":\"/api/v1/stt/jobs\"");
+    }
+
+    @Test
     void transcribesAnUploadedWavFile() throws Exception {
         HttpResponse<String> response = postWav("/api/v1/stt/transcriptions", wav(new byte[16000 * 2]));
 

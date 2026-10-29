@@ -3,6 +3,7 @@ package com.bocbang.backend.stt;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
+import com.bocbang.backend.TestSettings;
 import com.bocbang.backend.runtime.CapacityExceededException;
 import com.bocbang.backend.runtime.InferenceExecutor;
 import com.bocbang.backend.runtime.SessionLimiter;
@@ -37,7 +38,7 @@ class TranscriptionServiceTest {
     @Test
     void streamsWavPcmThroughEngineAndReturnsFinalText() throws Exception {
         FakeSpeechToTextEngine engine = new FakeSpeechToTextEngine("xin chào");
-        TranscriptionService service = new TranscriptionService(engine, limiter, executor);
+        TranscriptionService service = new TranscriptionService(engine, TestSettings.properties(), limiter, executor);
 
         byte[] oneSecondOfSilence = new byte[16000 * 2];
         TranscriptionService.Transcription result =
@@ -54,7 +55,7 @@ class TranscriptionServiceTest {
 
     @Test
     void refusesWhenEveryRecognitionSlotIsTaken() throws Exception {
-        TranscriptionService service = new TranscriptionService(new FakeSpeechToTextEngine("unused"), limiter, executor);
+        TranscriptionService service = new TranscriptionService(new FakeSpeechToTextEngine("unused"), TestSettings.properties(), limiter, executor);
         limiter.tryAcquire().orElseThrow();
         byte[] audio = wav(16000, 16, new byte[3200]);
 
@@ -64,7 +65,7 @@ class TranscriptionServiceTest {
 
     @Test
     void rejectsWavThatIsNotSixteenBitMono() throws Exception {
-        TranscriptionService service = new TranscriptionService(new FakeSpeechToTextEngine("unused"), limiter, executor);
+        TranscriptionService service = new TranscriptionService(new FakeSpeechToTextEngine("unused"), TestSettings.properties(), limiter, executor);
         byte[] eightBit = wav(8000, 8, new byte[8000]);
 
         assertThatThrownBy(() -> service.transcribeWav(new ByteArrayInputStream(eightBit)))
@@ -76,7 +77,7 @@ class TranscriptionServiceTest {
     @Timeout(10)
     void rejectsWavWhoseSampleRateIsOutsideTheSupportedRangeBeforeTakingASlot() throws Exception {
         FakeSpeechToTextEngine engine = new FakeSpeechToTextEngine("unused");
-        TranscriptionService service = new TranscriptionService(engine, limiter, executor);
+        TranscriptionService service = new TranscriptionService(engine, TestSettings.properties(), limiter, executor);
 
         for (float sampleRate : new float[] {1, 4000, 96000}) {
             byte[] audio = wav(sampleRate, 16, new byte[3200]);
@@ -93,7 +94,7 @@ class TranscriptionServiceTest {
     @Timeout(15)
     void doesNotCloseTheSessionUnderAnInferenceThreadWhenTheRequestIsInterrupted() throws Exception {
         GatedEngine engine = new GatedEngine();
-        TranscriptionService service = new TranscriptionService(engine, limiter, executor);
+        TranscriptionService service = new TranscriptionService(engine, TestSettings.properties(), limiter, executor);
         byte[] audio = wav(16000, 16, new byte[3200]);
         AtomicReference<Throwable> outcome = new AtomicReference<>();
         Thread request = new Thread(() -> {
@@ -120,14 +121,14 @@ class TranscriptionServiceTest {
 
     @Test
     void rejectsInputThatIsNotWav() {
-        TranscriptionService service = new TranscriptionService(new FakeSpeechToTextEngine("unused"), limiter, executor);
+        TranscriptionService service = new TranscriptionService(new FakeSpeechToTextEngine("unused"), TestSettings.properties(), limiter, executor);
 
         assertThatThrownBy(() -> service.transcribeWav(new ByteArrayInputStream("hello".getBytes())))
                 .isInstanceOf(IllegalArgumentException.class);
     }
 
     /** Holds one engine call open so a test can act while an inference thread is inside the session. */
-    private static final class GatedEngine implements SpeechToTextEngine {
+    private static final class GatedEngine extends FakeSpeechToTextEngine {
 
         final CountDownLatch enteredAccept = new CountDownLatch(1);
         final CountDownLatch gate = new CountDownLatch(1);
@@ -135,9 +136,8 @@ class TranscriptionServiceTest {
         final AtomicBoolean busy = new AtomicBoolean();
         final AtomicBoolean closedWhileBusy = new AtomicBoolean();
 
-        @Override
-        public String name() {
-            return "gated";
+        GatedEngine() {
+            super("");
         }
 
         @Override

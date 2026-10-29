@@ -30,17 +30,20 @@ public class TranscriptionService {
     private static final int BYTES_PER_SAMPLE = 2;
 
     private final SpeechToTextEngine engine;
+    private final SttProperties properties;
     private final SessionLimiter limiter;
     private final InferenceExecutor executor;
 
-    public TranscriptionService(SpeechToTextEngine engine, SessionLimiter limiter, InferenceExecutor executor) {
+    public TranscriptionService(SpeechToTextEngine engine, SttProperties properties, SessionLimiter limiter,
+            InferenceExecutor executor) {
         this.engine = engine;
+        this.properties = properties;
         this.limiter = limiter;
         this.executor = executor;
     }
 
     /**
-     * @throws IllegalArgumentException if the input is not a 16-bit little-endian mono PCM WAV
+     * @throws IllegalArgumentException if the input is not a 16-bit little-endian mono PCM WAV at the model's rate
      * @throws CapacityExceededException if every recognition slot is taken
      */
     public Transcription transcribeWav(InputStream wav) throws IOException {
@@ -56,9 +59,9 @@ public class TranscriptionService {
                 throw new IllegalArgumentException("Only 16-bit little-endian PCM mono WAV is supported");
             }
             sampleRate = Math.round(format.getSampleRate());
-            if (!SampleRates.isSupported(sampleRate)) {
-                throw new IllegalArgumentException("WAV sample rate must be between " + SampleRates.MIN + " and "
-                        + SampleRates.MAX + " Hz, got " + sampleRate);
+            if (sampleRate != properties.sampleRate()) {
+                throw new IllegalArgumentException(
+                        "WAV sample rate must be " + properties.sampleRate() + " Hz, got " + sampleRate);
             }
             pcm = audio.readAllBytes();
         } catch (UnsupportedAudioFileException e) {
