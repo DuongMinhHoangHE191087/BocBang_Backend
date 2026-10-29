@@ -1,5 +1,6 @@
 package com.bocbang.backend.websocket;
 
+import com.bocbang.backend.stt.SpeechRecognitionException;
 import com.bocbang.backend.stt.SpeechSession;
 import com.bocbang.backend.stt.SpeechToTextEngine;
 import com.bocbang.backend.stt.SttProperties;
@@ -20,19 +21,17 @@ import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.ObjectMapper;
 
 /**
- * Streaming speech-to-text over WebSocket at {@code /ws/stt?sampleRate=16000}.
+ * Speech-to-text over WebSocket at {@code /ws/stt?sampleRate=16000}.
  *
- * <p>Client to server: binary frames of 16-bit little-endian mono PCM; text frame {@code {"type":"end"}}
- * to finish the current utterance.
- * <p>Server to client (JSON text): {@code ready} once on connect, then {@code partial} and {@code final}
- * transcripts, or {@code error}.
+ * <p>Client to server: binary frames of 16-bit little-endian mono PCM at the model's sample rate;
+ * text frame {@code {"type":"end"}} to finish the current utterance.
+ * <p>Server to client (JSON text): {@code ready} once on connect, {@code final} after each
+ * {@code end}, or {@code error}. Engines that support streaming may also send {@code partial}.
  */
 @Component
 public class SpeechWebSocketHandler extends AbstractWebSocketHandler {
 
     private static final String SESSION_ATTRIBUTE = "speechSession";
-    private static final int MIN_SAMPLE_RATE = 8000;
-    private static final int MAX_SAMPLE_RATE = 48000;
 
     private static final ObjectMapper JSON = new ObjectMapper();
 
@@ -63,7 +62,7 @@ public class SpeechWebSocketHandler extends AbstractWebSocketHandler {
     }
 
     @Override
-    protected void handleBinaryMessage(WebSocketSession webSocket, BinaryMessage message) throws IOException {
+    protected void handleBinaryMessage(WebSocketSession webSocket, BinaryMessage message) {
         ByteBuffer payload = message.getPayload();
         byte[] pcm = new byte[payload.remaining()];
         payload.get(pcm);
@@ -71,12 +70,16 @@ public class SpeechWebSocketHandler extends AbstractWebSocketHandler {
             sendError(webSocket, "PCM 16-bit frames must have an even number of bytes");
             return;
         }
-        speechSession(webSocket).accept(pcm, pcm.length)
-                .ifPresent(event -> sendTranscript(webSocket, event));
+        try {
+            speechSession(webSocket).accept(pcm, pcm.length)
+                    .ifPresent(event -> sendTranscript(webSocket, event));
+        } catch (IllegalArgumentException e) {
+            sendError(webSocket, e.getMessage() + ", send {\"type\":\"end\"} more often");
+        }
     }
 
     @Override
-    protected void handleTextMessage(WebSocketSession webSocket, TextMessage message) throws IOException {
+    protected void handleTextMessage(WebSocketSession webSocket, TextMessage message) {
         JsonNode command;
         try {
             command = JSON.readTree(message.getPayload());
@@ -84,10 +87,14 @@ public class SpeechWebSocketHandler extends AbstractWebSocketHandler {
             sendError(webSocket, "Text frame must be a JSON object");
             return;
         }
-        if ("end".equals(command.path("type").asString(""))) {
-            sendTranscript(webSocket, speechSession(webSocket).finish());
-        } else {
+        if (!"end".equals(command.path("type").asString(""))) {
             sendError(webSocket, "Unknown command, expected {\"type\":\"end\"}");
+            return;
+        }
+        try {
+            sendTranscript(webSocket, speechSession(webSocket).finish());
+        } catch (SpeechRecognitionException e) {
+            sendError(webSocket, e.getMessage());
         }
     }
 
@@ -104,12 +111,11 @@ public class SpeechWebSocketHandler extends AbstractWebSocketHandler {
                 .getQueryParams()
                 .getFirst("sampleRate");
         if (value == null) {
-            return properties.defaultSampleRate();
+            return properties.sampleRate();
         }
         int sampleRate = Integer.parseInt(value);
-        if (sampleRate < MIN_SAMPLE_RATE || sampleRate > MAX_SAMPLE_RATE) {
-            throw new IllegalArgumentException(
-                    "sampleRate must be between " + MIN_SAMPLE_RATE + " and " + MAX_SAMPLE_RATE);
+        if (sampleRate != properties.sampleRate()) {
+            throw new IllegalArgumentException("sampleRate must be " + properties.sampleRate());
         }
         return sampleRate;
     }
