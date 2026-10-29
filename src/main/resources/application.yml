@@ -48,26 +48,18 @@ stt:
   # jni (default, native models below) or mock (scripted words, no model files). A new engine registers itself
   # for its own name, see README.
   engine: ${STT_ENGINE:jni}
-  # How realtime streams share the machine (RuntimeProperties). The JNI engine only returns text after an end
-  # command, so a client keeps streaming the next utterance while the previous one is still being transcribed:
-  # allow that much audio to wait before the server calls the client too slow.
+  # How realtime streams share the machine (RuntimeProperties). On CPU, decoding a 15-20s utterance with a 1.7B model
+  # can take 30-60s while the client keeps streaming: allow 120s of buffered audio so WebSockets are not dropped early.
   session:
-    max-buffered-audio: ${STT_MAX_BUFFERED_AUDIO:30s}
+    max-buffered-audio: ${STT_MAX_BUFFERED_AUDIO:120s}
+  websocket:
+    idle-timeout: ${STT_WS_IDLE_TIMEOUT:180s}
   # API keys accepted on /api/** and /ws/**, comma-separated. Empty (default) turns authentication off.
   # Actuator probes and the demo page never need a key.
   security:
     api-keys: ${STT_API_KEYS:}
     # true also requires the key on /actuator/metrics, /prometheus and /info; the health probes stay open.
     protect-actuator: ${STT_PROTECT_ACTUATOR:false}
-  # pool:
-  #   workers: 0        # inference threads; 0 = CPU count - 1
-  #   max-sessions: 0   # concurrent streams; 0 = workers x the engine's streams per worker (jni 1, mock 4). Measure with real speech, then set it.
-  # session:
-  #   max-batch-audio: 500ms
-  # websocket:
-  #   allowed-origins: https://app.example.com
-  #   max-frame-bytes: 65536
-  #   idle-timeout: 60s
 
   # Model baseline: 16 kHz mono PCM. Realtime endpoints reject other rates; long-audio jobs convert via ffmpeg.
   sample-rate: 16000
@@ -103,8 +95,8 @@ stt:
     min-speech-duration-ms: 250
     min-silence-duration-ms: 100
     speech-pad-ms: 30
-    max-segment-seconds: 30
-    max-merge-gap-seconds: 1.0
+    max-segment-seconds: 20
+    max-merge-gap-seconds: 0.8
 
   # Transcript cleanup — loaded via libbocbang_llama.so (llama.cpp)
   refiner:

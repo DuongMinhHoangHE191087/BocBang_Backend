@@ -3,15 +3,15 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>BocBang - nhận dạng giọng nói trực tiếp</title>
-  <meta name="description" content="Trang thử máy chủ BocBang: nói vào micro hoặc phát file âm thanh, chữ hiện ngay theo thời gian thực.">
+  <title>BocBang - nhận dạng giọng nói &amp; bóc băng âm thanh dài</title>
+  <meta name="description" content="Trang thử máy chủ BocBang trên MediaTek G520: nhận dạng trực tiếp qua WebSocket hoặc bóc băng file âm thanh dài bất đồng bộ.">
   <link rel="stylesheet" href="app.css">
 </head>
 <body>
   <header class="top">
     <div>
       <h1>BocBang</h1>
-      <p class="tagline">Nói vào micro, chữ hiện ra ngay khi bạn nói.</p>
+      <p class="tagline">Nhận dạng trực tiếp hoặc tải lên file ghi âm dài (5–60+ phút) xử lý trên MediaTek G520.</p>
     </div>
     <div class="server" id="server" role="status" aria-live="polite">
       <span class="server-engine" id="serverEngine">Đang kiểm tra máy chủ</span>
@@ -22,34 +22,97 @@
 
   <main>
     <div class="left">
+      <section class="job-card" id="jobSection" aria-label="Bóc băng file âm thanh dài">
+        <div class="job-head">
+          <div>
+            <h2>Bóc băng file âm thanh dài (CPU bất đồng bộ)</h2>
+            <p class="note">Tải nguyên file (WAV, MP3, M4A, OGG, FLAC — tối đa 500 MB) qua <code>POST /api/v1/stt/jobs</code>, tự động chuẩn hóa 16 kHz → Silero VAD → ASR → làm sạch văn bản.</p>
+          </div>
+        </div>
+
+        <div class="job-grid">
+          <label class="field">
+            <span>File ghi âm cần bóc băng</span>
+            <input type="file" id="jobFile" accept="audio/*,.wav,.mp3,.m4a,.ogg,.flac">
+          </label>
+          <label class="field">
+            <span>Mô hình nhận dạng (ASR)</span>
+            <select id="jobModel">
+              <option value="qwen3-asr">qwen3-asr (Tiếng Việt / Đa ngôn ngữ)</option>
+              <option value="whisper-en">whisper-en (Tiếng Anh)</option>
+            </select>
+          </label>
+        </div>
+
+        <label class="choice job-check">
+          <input type="checkbox" id="jobRefine" checked>
+          <span>Làm sạch dấu câu, viết hoa &amp; lỗi nhận dạng bằng LLM (<code>qwen3-4b-instruct</code>)</span>
+        </label>
+
+        <div class="job-actions">
+          <button type="button" class="primary" id="jobSubmit">Tải lên &amp; Bóc băng</button>
+          <button type="button" class="secondary danger-outline" id="jobCancel" hidden>Hủy tác vụ</button>
+          <button type="button" class="secondary" id="jobCopy" hidden>Sao chép kết quả</button>
+        </div>
+
+        <p class="status" id="jobError" role="alert" hidden></p>
+
+        <div class="job-progress" id="jobProgressBox" hidden>
+          <div class="job-progress-row">
+            <span id="jobStageText">Đang xếp hàng...</span>
+            <span class="job-meta" id="jobMetaText">0%</span>
+          </div>
+          <div class="meter job-meter" aria-hidden="true">
+            <span class="meter-fill" id="jobMeterFill"></span>
+          </div>
+        </div>
+
+        <div class="job-output" id="jobOutput" hidden>
+          <div class="job-result-box">
+            <h3>Văn bản hoàn chỉnh</h3>
+            <div class="job-text" id="jobText"></div>
+          </div>
+
+          <details class="job-details" id="jobRawWrap" hidden>
+            <summary>Xem văn bản thô từ ASR (trước khi Qwen3-4B làm sạch)</summary>
+            <div class="job-raw" id="jobRawText"></div>
+          </details>
+
+          <details class="job-details" id="jobSegmentsWrap" open hidden>
+            <summary id="jobSegmentsSummary">Các phân đoạn theo mốc thời gian (VAD)</summary>
+            <div class="job-segments" id="jobSegments"></div>
+          </details>
+        </div>
+      </section>
+
       <section class="stage" aria-label="Phụ đề trực tiếp">
         <canvas id="ribbon" class="ribbon" height="96" aria-hidden="true"></canvas>
         <div class="transcript" id="transcript">
           <div id="finals" aria-live="polite"></div>
           <p class="partial" id="partial" aria-live="off"></p>
-          <p class="hint" id="hint">Chọn nguồn âm thanh rồi nhấn Bắt đầu.</p>
+          <p class="hint" id="hint">Phụ đề luồng trực tiếp (WebSocket): chọn nguồn âm thanh bên phải rồi nhấn Bắt đầu.</p>
         </div>
       </section>
       <section class="clients" id="clients" aria-label="Các kết nối song song" hidden></section>
     </div>
 
-    <aside class="rail" aria-label="Điều khiển">
+    <aside class="rail" aria-label="Điều khiển luồng trực tiếp">
       <fieldset class="block">
-        <legend>Nguồn âm thanh</legend>
+        <legend>Luồng trực tiếp (WebSocket)</legend>
         <label class="choice"><input type="radio" name="source" value="mic" checked> Micro</label>
-        <label class="choice"><input type="radio" name="source" value="file"> File âm thanh</label>
+        <label class="choice"><input type="radio" name="source" value="file"> Phát giả lập từ file</label>
         <p class="note" id="micNote" hidden></p>
 
         <div class="file-options" id="fileOptions" hidden>
           <label class="field">
-            <span>Chọn file (wav, mp3, ogg, m4a)</span>
+            <span>Chọn file ngắn (wav, mp3, ogg, m4a)</span>
             <input type="file" id="file" accept="audio/*">
           </label>
           <label class="field">
             <span>Số kết nối chạy song song</span>
             <input type="number" id="count" min="1" max="64" value="1" inputmode="numeric">
           </label>
-          <p class="note">Mỗi kết nối phát lại cùng file ở tốc độ thật, dùng để thử tải nhiều người dùng.</p>
+          <p class="note">Phát file ở tốc độ thật qua WebSocket để thử phụ đề trực tiếp.</p>
         </div>
       </fieldset>
 
@@ -61,7 +124,7 @@
       </div>
 
       <div class="block">
-        <button type="button" class="primary" id="toggle">Bắt đầu</button>
+        <button type="button" class="primary" id="toggle">Bắt đầu luồng</button>
         <p class="status" id="status" role="status" aria-live="polite">Sẵn sàng.</p>
       </div>
 
@@ -73,9 +136,9 @@
       </dl>
 
       <div class="block">
-        <h2>Gửi cả file qua REST</h2>
-        <p class="note">Gửi cả file đã chọn lên <code>POST /api/v1/stt/transcriptions</code>.</p>
-        <button type="button" class="secondary" id="rest">Chuyển file thành văn bản</button>
+        <h2>Gửi nhanh đoạn ngắn (&le; 60s)</h2>
+        <p class="note">Đồng bộ qua <code>POST /api/v1/stt/transcriptions</code> (dùng file chọn ở trên).</p>
+        <button type="button" class="secondary" id="rest">Nhận dạng nhanh đoạn ngắn</button>
         <p class="rest-result" id="restResult" role="status" aria-live="polite"></p>
       </div>
     </aside>

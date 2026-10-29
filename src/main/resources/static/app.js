@@ -4,15 +4,31 @@
   const TARGET_RATE = 16000;
   const FRAME_SAMPLES = 1600; // 100 ms
   const FRAME_MS = 100;
-  const STATUS_POLL_MS = 1500;
-  // Engines that answer only after an end command (the native one) need the end sent when the speaker pauses,
-  // and a long wait for the last answer after Stop.
-  const FINAL_TIMEOUT_MS = 30000;
+  const STATUS_POLL_MS = 2000;
+  const JOB_POLL_MS = 1500;
+  // On CPU, decoding a 15 s utterance with Qwen3-ASR 1.7B can take 20-45 s.
+  const FINAL_TIMEOUT_MS = 120000;
   const SPEECH_RMS = 0.015; // frame loudness that counts as speech
   const PAUSE_FRAMES = 8; // 0.8 s of quiet closes an utterance
   const MIN_SPEECH_FRAMES = 3;
   const PREROLL_FRAMES = 3; // 0.3 s kept from before the first loud frame, so the start of a word is not clipped
-  const MAX_UTTERANCE_FRAMES = 250; // 25 s of audio sent since the last end, well inside the server's 60 s limit
+  const MAX_UTTERANCE_FRAMES = 150; // 15 s chunks keep CPU latency lower and avoid Qwen3-ASR token cap truncation
+
+  const MODEL_LABELS = {
+    'qwen3-asr': 'qwen3-asr (Tiếng Việt / Đa ngôn ngữ)',
+    'whisper-en': 'whisper-en (Tiếng Anh)',
+  };
+
+  const STAGE_LABELS = {
+    QUEUED: 'Đang xếp hàng chờ CPU...',
+    CONVERTING: 'Đang chuẩn hóa âm thanh 16 kHz mono (ffmpeg)...',
+    DETECTING_SPEECH: 'Đang tách đoạn có tiếng nói (Silero VAD)...',
+    TRANSCRIBING: 'Đang nhận dạng giọng nói trên CPU...',
+    REFINING: 'Đang làm sạch văn bản bằng Qwen3-4B...',
+    DONE: 'Hoàn tất',
+    FAILED: 'Thất bại',
+    CANCELLED: 'Đã hủy',
+  };
 
   const $ = (id) => document.getElementById(id);
   const el = {
@@ -22,6 +38,13 @@
     statLag: $('statLag'), statLagMax: $('statLagMax'), statFrames: $('statFrames'), statOpen: $('statOpen'),
     clients: $('clients'), rest: $('rest'), restResult: $('restResult'),
     server: $('server'), serverEngine: $('serverEngine'), serverLoad: $('serverLoad'), meterFill: $('meterFill'),
+    jobFile: $('jobFile'), jobModel: $('jobModel'), jobRefine: $('jobRefine'),
+    jobSubmit: $('jobSubmit'), jobCancel: $('jobCancel'), jobCopy: $('jobCopy'),
+    jobError: $('jobError'), jobProgressBox: $('jobProgressBox'), jobStageText: $('jobStageText'),
+    jobMetaText: $('jobMetaText'), jobMeterFill: $('jobMeterFill'),
+    jobOutput: $('jobOutput'), jobText: $('jobText'),
+    jobRawWrap: $('jobRawWrap'), jobRawText: $('jobRawText'),
+    jobSegmentsWrap: $('jobSegmentsWrap'), jobSegmentsSummary: $('jobSegmentsSummary'), jobSegments: $('jobSegments'),
   };
 
   const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -68,8 +91,6 @@
         const fail = (error) => { if (!settled) { settled = true; reject(error); } };
         ws.onmessage = (event) => {
           const message = JSON.parse(event.data);
-          // Every end is answered by a final or by recognition_failed. A streaming engine can also send finals nobody
-          // asked for; those cannot be told apart here, so the count never goes below zero.
           if (message.type === 'final' || message.code === 'recognition_failed') {
             this.pendingEnds = Math.max(0, this.pendingEnds - 1);
           }
@@ -195,7 +216,7 @@
   /** Microphone: the worklet resamples to 16 kHz and posts 100 ms frames. */
   async function openMic() {
     if (!window.isSecureContext) {
-      throw new Error('Trình duyệt chỉ cho dùng micro trên https hoặc localhost. Hãy chọn File âm thanh.');
+      throw new Error('Trình duyệt chỉ cho dùng micro trên https hoặc localhost. Hãy dùng mục Bóc băng file dài ở bên trái.');
     }
     const stream = await navigator.mediaDevices.getUserMedia({
       audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true },
@@ -302,8 +323,15 @@
   }
 
   const clock = (ms) => {
-    const total = Math.floor(ms / 1000);
+    const total = Math.max(0, Math.floor(ms / 1000));
     return `${String(Math.floor(total / 60)).padStart(2, '0')}:${String(total % 60).padStart(2, '0')}`;
+  };
+
+  const formatTimestamp = (seconds) => {
+    const s = Math.max(0, Number(seconds) || 0);
+    const mins = Math.floor(s / 60);
+    const rem = (s - mins * 60).toFixed(1).padStart(4, '0');
+    return `${String(mins).padStart(2, '0')}:${rem}`;
   };
 
   function renderStats() {
@@ -389,7 +417,7 @@
         }
         renderStats();
         if (run.active && run.connections.every((c) => !c.ready)) {
-          stop(`Mất kết nối (mã ${event.code}).`, true);
+          stop(`Mất kết nối (mã ${event.code}). Với file dài > 1 phút, hãy dùng mục "Bóc băng file âm thanh dài" ở bên trái.`, true);
         }
       },
     };
@@ -407,11 +435,6 @@
     renderStats();
   }
 
-  /**
-   * Audio goes to the server only while someone is speaking. Quiet before the first word is not sent: a minute of
-   * silence would otherwise fill the server's utterance limit before the speaker says anything. An utterance is
-   * closed with end when the speaker pauses, or when 25 s of audio has been sent since the last end.
-   */
   const utterance = { speaking: false, loud: 0, quiet: 0, sent: 0, preroll: [] };
   const resetUtterance = () => Object.assign(utterance, { speaking: false, loud: 0, quiet: 0, sent: 0, preroll: [] });
 
@@ -448,7 +471,6 @@
       run.connections.forEach((connection) => connection.end());
       resetUtterance();
     } else if (paused) {
-      // A burst too short to be speech: stop streaming, but keep the sent count so the server-side total stays bounded.
       Object.assign(utterance, { speaking: false, loud: 0, quiet: 0, preroll: [] });
     }
     if (run.frames % 5 === 0) {
@@ -499,7 +521,7 @@
     run.active = true;
     run.source = source;
     run.startedAt = performance.now();
-    el.toggle.textContent = 'Dừng';
+    el.toggle.textContent = 'Dừng luồng';
     el.toggle.classList.add('running');
     el.toggle.disabled = false;
     const refused = total - opened;
@@ -518,7 +540,7 @@
     const { source, connections } = run;
     source.stop();
     el.toggle.disabled = true;
-    setStatus('Đang nhận dạng câu cuối...');
+    setStatus('Đang nhận dạng câu cuối trên CPU...');
     connections.forEach((connection) => connection.end());
     const deadline = performance.now() + FINAL_TIMEOUT_MS;
     while (performance.now() < deadline && connections.some((c) => c.ready && c.pendingEnds > 0)) {
@@ -526,7 +548,7 @@
     }
     const unanswered = connections.some((c) => c.ready && c.pendingEnds > 0);
     connections.forEach((connection) => connection.close());
-    el.toggle.textContent = 'Bắt đầu';
+    el.toggle.textContent = 'Bắt đầu luồng';
     el.toggle.classList.remove('running');
     el.toggle.disabled = false;
     if (unanswered) {
@@ -539,18 +561,25 @@
 
   el.toggle.addEventListener('click', () => (run.active ? stop() : start()));
 
+  if (!window.isSecureContext) {
+    const fileRadio = document.querySelector('input[name="source"][value="file"]');
+    if (fileRadio) {
+      fileRadio.checked = true;
+    }
+  }
+
   function syncSource() {
     const file = selectedSource() === 'file';
     el.fileOptions.hidden = !file;
-    el.micNote.hidden = file || window.isSecureContext;
+    el.micNote.hidden = window.isSecureContext;
     if (!window.isSecureContext) {
-      el.micNote.textContent = 'Micro cần https hoặc localhost. Mở trang này bằng http://localhost:8080 hoặc dùng File âm thanh.';
+      const port = location.port ? `:${location.port}` : '';
+      el.micNote.textContent = `Micro trình duyệt cần HTTPS (Nginx) hoặc http://localhost${port}. Trên Wi-Fi LAN HTTP, hãy tải file trực tiếp.`;
     }
   }
   document.querySelectorAll('input[name="source"]').forEach((input) => input.addEventListener('change', syncSource));
   syncSource();
 
-  /** The same file, sent whole to the REST endpoint as a 16 kHz mono WAV. */
   function encodeWav(pcm) {
     const buffer = new ArrayBuffer(44 + pcm.length * 2);
     const view = new DataView(buffer);
@@ -572,14 +601,14 @@
   }
 
   el.rest.addEventListener('click', async () => {
-    const file = el.file.files[0];
+    const file = el.file.files[0] || el.jobFile.files[0];
     const show = (text, isError) => {
       el.restResult.textContent = text;
       el.restResult.classList.toggle('error', Boolean(isError));
     };
     if (!file) {
       document.querySelector('input[name="source"][value="file"]').click();
-      show('Chọn một file ở mục Nguồn âm thanh, rồi bấm lại nút này.', true);
+      show('Chọn một file âm thanh trước, rồi bấm lại nút này.', true);
       return;
     }
     el.rest.disabled = true;
@@ -605,6 +634,227 @@
     }
   });
 
+  // =========================================================================
+  // Long-audio asynchronous job pipeline (POST /api/v1/stt/jobs -> GET /jobs/{id})
+  // =========================================================================
+  const jobState = {
+    jobId: null,
+    pollTimer: null,
+    startedAt: 0,
+    modelsSynced: false,
+    transientFailures: 0,
+  };
+
+  function setJobError(msg) {
+    el.jobError.hidden = !msg;
+    el.jobError.textContent = msg || '';
+    el.jobError.classList.toggle('error', Boolean(msg));
+  }
+
+  function renderJob(job) {
+    el.jobProgressBox.hidden = false;
+    const pct = Math.max(0, Math.min(100, Math.round((job.progress || 0) * 100)));
+    el.jobMeterFill.style.width = `${pct}%`;
+
+    let stageLabel = STAGE_LABELS[job.stage] || job.stage || '';
+    if (job.stage === 'TRANSCRIBING' && job.totalSegments > 0) {
+      stageLabel = `Đang nhận dạng đoạn ${job.completedSegments}/${job.totalSegments} (${job.model})...`;
+    } else if (job.status === 'DONE') {
+      const dur = job.durationSeconds ? ` — độ dài âm thanh ${clock(job.durationSeconds * 1000)}` : '';
+      stageLabel = `Hoàn tất (${job.model}${job.refine ? ' + Qwen3-4B' : ''})${dur}`;
+    }
+
+    const elapsed = clock(performance.now() - jobState.startedAt);
+    el.jobStageText.textContent = stageLabel;
+    el.jobMetaText.textContent = `${pct}% · ${elapsed}`;
+
+    const segments = Array.isArray(job.segments) ? job.segments : [];
+    const hasText = Boolean((job.text && job.text.trim()) || (job.rawText && job.rawText.trim()) || segments.length);
+
+    if (hasText || job.status === 'DONE') {
+      el.jobOutput.hidden = false;
+      const displayMain = job.text || job.rawText || '(Không phát hiện lời nói trong file âm thanh)';
+      el.jobText.textContent = displayMain;
+      el.jobCopy.hidden = !(job.text || job.rawText);
+
+      const showRaw = Boolean(job.refine && job.rawText && job.text && job.rawText.trim() !== job.text.trim());
+      el.jobRawWrap.hidden = !showRaw;
+      if (showRaw) {
+        el.jobRawText.textContent = job.rawText;
+      }
+
+      el.jobSegmentsWrap.hidden = segments.length === 0;
+      if (segments.length > 0) {
+        el.jobSegmentsSummary.textContent = `Các phân đoạn theo mốc thời gian (${segments.length} đoạn)`;
+        el.jobSegments.textContent = '';
+        segments.forEach((seg) => {
+          const row = document.createElement('div');
+          row.className = 'seg-row';
+          const time = document.createElement('span');
+          time.className = 'seg-time';
+          time.textContent = `${formatTimestamp(seg.start)} → ${formatTimestamp(seg.end)}`;
+          const body = document.createElement('span');
+          body.className = 'seg-body';
+          body.textContent = seg.text || '';
+          row.append(time, body);
+          el.jobSegments.appendChild(row);
+        });
+      }
+    }
+
+    if (job.status === 'FAILED') {
+      setJobError(job.error || 'Tác vụ xử lý thất bại trên máy chủ.');
+    } else if (job.status === 'CANCELLED') {
+      setJobError('Tác vụ đã bị hủy.');
+    }
+  }
+
+  function finishJobPolling() {
+    if (jobState.pollTimer) {
+      clearTimeout(jobState.pollTimer);
+      jobState.pollTimer = null;
+    }
+    jobState.jobId = null;
+    jobState.transientFailures = 0;
+    el.jobSubmit.disabled = false;
+    el.jobCancel.hidden = true;
+    el.jobCancel.disabled = false;
+  }
+
+  async function pollJob(jobId) {
+    if (jobState.jobId !== jobId) {
+      return;
+    }
+    try {
+      const response = await fetch(`/api/v1/stt/jobs/${encodeURIComponent(jobId)}`, {
+        cache: 'no-store',
+        headers: authHeaders(),
+      });
+      if (!response.ok) {
+        const body = await response.json().catch(() => ({}));
+        throw new Error(body.detail || `Không đọc được trạng thái tác vụ (HTTP ${response.status}).`);
+      }
+      jobState.transientFailures = 0;
+      setJobError('');
+      const job = await response.json();
+      renderJob(job);
+      if (job.status === 'DONE' || job.status === 'FAILED' || job.status === 'CANCELLED') {
+        finishJobPolling();
+        return;
+      }
+    } catch (error) {
+      jobState.transientFailures++;
+      if (jobState.transientFailures >= 10) {
+        setJobError(error.message || 'Mất kết nối lâu với máy chủ khi kiểm tra tiến độ.');
+      }
+    }
+    if (jobState.jobId === jobId) {
+      jobState.pollTimer = setTimeout(() => pollJob(jobId), JOB_POLL_MS);
+    }
+  }
+
+  el.jobSubmit.addEventListener('click', async () => {
+    const file = el.jobFile.files[0] || el.file.files[0];
+    if (!file) {
+      setJobError('Vui lòng chọn file âm thanh cần bóc băng trước.');
+      el.jobFile.focus();
+      return;
+    }
+    setJobError('');
+    el.jobSubmit.disabled = true;
+    el.jobCopy.hidden = true;
+    el.jobOutput.hidden = true;
+    el.jobProgressBox.hidden = false;
+    el.jobMeterFill.style.width = '2%';
+    el.jobStageText.textContent = `Đang tải file "${file.name}" (${(file.size / (1024 * 1024)).toFixed(1)} MB) lên board...`;
+    el.jobMetaText.textContent = '0%';
+    jobState.startedAt = performance.now();
+    jobState.transientFailures = 0;
+
+    try {
+      const form = new FormData();
+      form.append('file', file, file.name);
+      form.append('model', el.jobModel.value);
+      form.append('refine', String(el.jobRefine.checked));
+
+      const response = await fetch('/api/v1/stt/jobs', {
+        method: 'POST',
+        body: form,
+        headers: authHeaders(),
+      });
+      const body = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        throw new Error(body.detail || `${response.status} ${body.title || 'Không tạo được tác vụ.'}`);
+      }
+      jobState.jobId = body.jobId;
+      el.jobCancel.hidden = false;
+      el.jobCancel.disabled = false;
+      renderJob(body);
+      jobState.pollTimer = setTimeout(() => pollJob(body.jobId), 600);
+    } catch (error) {
+      setJobError(error.message || 'Không gửi được file lên máy chủ.');
+      finishJobPolling();
+    }
+  });
+
+  el.jobCancel.addEventListener('click', async () => {
+    const id = jobState.jobId;
+    if (!id) {
+      return;
+    }
+    el.jobCancel.disabled = true;
+    try {
+      await fetch(`/api/v1/stt/jobs/${encodeURIComponent(id)}`, {
+        method: 'DELETE',
+        headers: authHeaders(),
+      });
+    } catch (error) {
+      // Next poll or local cleanup handles state.
+    }
+    setJobError('Đã gửi yêu cầu hủy tác vụ.');
+    finishJobPolling();
+  });
+
+  el.jobCopy.addEventListener('click', async () => {
+    const text = el.jobText.textContent || '';
+    if (!text) {
+      return;
+    }
+    try {
+      await navigator.clipboard.writeText(text);
+      const prev = el.jobCopy.textContent;
+      el.jobCopy.textContent = 'Đã sao chép!';
+      setTimeout(() => { el.jobCopy.textContent = prev; }, 1500);
+    } catch (error) {
+      const range = document.createRange();
+      range.selectNodeContents(el.jobText);
+      const sel = window.getSelection();
+      sel.removeAllRanges();
+      sel.addRange(range);
+    }
+  });
+
+  function syncModelsFromStatus(status) {
+    if (jobState.modelsSynced || !Array.isArray(status.models) || status.models.length === 0) {
+      return;
+    }
+    jobState.modelsSynced = true;
+    el.jobModel.textContent = '';
+    status.models.forEach((m) => {
+      const opt = document.createElement('option');
+      opt.value = m;
+      opt.textContent = MODEL_LABELS[m] || m;
+      if (m === status.defaultModel) {
+        opt.selected = true;
+      }
+      el.jobModel.appendChild(opt);
+    });
+    if (typeof status.refinerEnabled === 'boolean') {
+      el.jobRefine.checked = status.refinerEnabled;
+      el.jobRefine.disabled = !status.refinerEnabled;
+    }
+  }
+
   async function pollStatus() {
     try {
       const response = await fetch('/api/v1/stt/status', { cache: 'no-store', headers: authHeaders() });
@@ -615,12 +865,13 @@
         return;
       }
       const status = await response.json();
+      syncModelsFromStatus(status);
       const { activeSessions, maxSessions, workers, queuedTasks } = status.capacity;
       el.serverEngine.textContent = `Engine ${status.engine}`;
       el.serverLoad.textContent = status.ready
-        ? `${activeSessions}/${maxSessions} luồng, ${workers} luồng xử lý, hàng đợi ${queuedTasks}`
+        ? `${activeSessions}/${maxSessions} luồng, ${workers} worker, chờ ${queuedTasks}`
         : `Đầy ${activeSessions}/${maxSessions}`;
-      el.meterFill.style.width = `${Math.min(100, (activeSessions / maxSessions) * 100)}%`;
+      el.meterFill.style.width = `${Math.min(100, (activeSessions / Math.max(1, maxSessions)) * 100)}%`;
       el.server.classList.toggle('full', !status.ready);
     } catch (error) {
       el.serverEngine.textContent = 'Không liên lạc được máy chủ';
