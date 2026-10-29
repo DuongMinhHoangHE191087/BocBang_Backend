@@ -11,7 +11,7 @@
   const el = {
     ribbon: $('ribbon'), transcript: $('transcript'), finals: $('finals'), partial: $('partial'), hint: $('hint'),
     toggle: $('toggle'), status: $('status'), micNote: $('micNote'),
-    fileOptions: $('fileOptions'), file: $('file'), count: $('count'),
+    fileOptions: $('fileOptions'), file: $('file'), count: $('count'), apiKey: $('apiKey'),
     statLag: $('statLag'), statLagMax: $('statLagMax'), statFrames: $('statFrames'), statOpen: $('statOpen'),
     clients: $('clients'), rest: $('rest'), restResult: $('restResult'),
     server: $('server'), serverEngine: $('serverEngine'), serverLoad: $('serverLoad'), meterFill: $('meterFill'),
@@ -19,6 +19,23 @@
 
   const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
   const selectedSource = () => document.querySelector('input[name="source"]:checked').value;
+
+  const KEY_STORAGE = 'bocbang.apiKey';
+  try {
+    el.apiKey.value = sessionStorage.getItem(KEY_STORAGE) || '';
+  } catch (error) {
+    // Storage can be blocked; the key then lasts until the page reloads.
+  }
+  el.apiKey.addEventListener('input', () => {
+    try {
+      sessionStorage.setItem(KEY_STORAGE, el.apiKey.value);
+    } catch (error) {
+      // Same as above.
+    }
+  });
+  const apiKey = () => el.apiKey.value.trim();
+  /** Headers for REST calls; a browser WebSocket cannot set headers, so it sends the key in the URL instead. */
+  const authHeaders = () => (apiKey() ? { Authorization: `Bearer ${apiKey()}` } : {});
 
   /** One WebSocket to /ws/stt. Resolves open() once the server says it is ready. */
   class SttConnection {
@@ -32,7 +49,8 @@
     open() {
       return new Promise((resolve, reject) => {
         const scheme = location.protocol === 'https:' ? 'wss' : 'ws';
-        const ws = new WebSocket(`${scheme}://${location.host}/ws/stt?sampleRate=${TARGET_RATE}`);
+        const key = apiKey() ? `&apiKey=${encodeURIComponent(apiKey())}` : '';
+        const ws = new WebSocket(`${scheme}://${location.host}/ws/stt?sampleRate=${TARGET_RATE}${key}`);
         ws.binaryType = 'arraybuffer';
         this.ws = ws;
         let settled = false;
@@ -55,7 +73,7 @@
         ws.onclose = (event) => {
           this.ready = false;
           this.handlers.onClose(event, reason);
-          fail(new Error('Không kết nối được tới máy chủ'));
+          fail(new Error('Không kết nối được tới máy chủ. Nếu máy chủ bật xác thực, kiểm tra khóa API.'));
         };
       });
     }
@@ -497,7 +515,7 @@
       const form = new FormData();
       form.append('file', new Blob([encodeWav(pcm)], { type: 'audio/wav' }), 'audio.wav');
       const startedAt = performance.now();
-      const response = await fetch('/api/v1/stt/transcriptions', { method: 'POST', body: form });
+      const response = await fetch('/api/v1/stt/transcriptions', { method: 'POST', body: form, headers: authHeaders() });
       const body = await response.json().catch(() => ({}));
       if (response.ok) {
         const took = Math.round(performance.now() - startedAt);
@@ -515,7 +533,13 @@
 
   async function pollStatus() {
     try {
-      const response = await fetch('/api/v1/stt/status', { cache: 'no-store' });
+      const response = await fetch('/api/v1/stt/status', { cache: 'no-store', headers: authHeaders() });
+      if (response.status === 401) {
+        el.serverEngine.textContent = 'Máy chủ cần khóa API';
+        el.serverLoad.textContent = '';
+        setTimeout(pollStatus, STATUS_POLL_MS);
+        return;
+      }
       const status = await response.json();
       const { activeSessions, maxSessions, workers, queuedTasks } = status.capacity;
       el.serverEngine.textContent = `Engine ${status.engine}`;

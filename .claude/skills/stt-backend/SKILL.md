@@ -26,6 +26,7 @@ Lỗi luôn có `code` (`invalid_sample_rate`, `capacity_exceeded`, `overloaded`
 - Giới hạn tải, chọn engine, WebSocket: `runtime/RuntimeProperties.java`, `application.yml`. Model, thư viện native, VAD, refiner, job: `stt/SttProperties.java`. Hai record cùng tiền tố `stt`; test dựng bằng `TestSettings.runtime(...)` và `TestSettings.properties(...)`.
 - Đổi REST: `api/SttController.java` (phục vụ cả `/api/v1/stt` và `/api/stt` cũ), lỗi trong `api/ApiExceptionHandler.java` (RFC 9457).
 - Đổi cách đọc file WAV ngắn: `stt/TranscriptionService.java` (chỉ nhận WAV 16-bit PCM mono đúng `stt.sample-rate`). File dài: `stt/TranscriptionJobService.java`.
+- Khóa API: `security/ApiKeyFilter.java` và `SecurityProperties` (`stt.security.api-keys` hay `STT_API_KEYS`, rỗng là tắt). Khóa gửi bằng `Authorization: Bearer` hoặc `X-Api-Key`; riêng `/ws/**` nhận thêm `?apiKey=` vì trình duyệt không đặt được header cho WebSocket. Đổi thì cập nhật `ApiKeyFilterTest`, `SttSecurityEndToEndTest`, ô "Khóa API" trong `static/app.js` và README.md.
 - Phần C++ và JNI: `native/`, `stt/jni/`; cách biên dịch trong README.md.
 - Web demo: `src/main/resources/static/` (`index.html`, `app.css`, `app.js`, `pcm-worklet.js`), không dùng CDN hay bước build.
 - Chọn engine: `STT_ENGINE=jni|mock` (mặc định `jni`). Model: `stt.models.*`, thư mục model `STT_MODEL_DIR`.

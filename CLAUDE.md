@@ -9,7 +9,7 @@ Nhận PCM qua WebSocket `/ws/stt` và trả JSON realtime. REST nằm dưới `
 
 ## Cấu trúc và quy ước
 
-- Package gốc: `com.bocbang.backend`. Các package: `api/`, `websocket/`, `runtime/`, `stt/`, `stt/jni/`, `stt/mock/`.
+- Package gốc: `com.bocbang.backend`. Các package: `api/`, `websocket/`, `runtime/`, `security/`, `stt/`, `stt/jni/`, `stt/mock/`.
 - Mã nguồn C++ JNI nằm trong `native/` (`CMakeLists.txt`, `transcribe_jni.cpp`, `whisper_jni.cpp`, `llama_jni.cpp`, `exports.map`). Mỗi thư viện `.so` ẩn toàn bộ symbol `ggml_*` nội bộ qua `exports.map` để không đụng nhau khi nạp chung trong một JVM.
 - Model nhận dạng luôn đi qua interface `SpeechToTextEngine` / `SpeechSession` trong `stt/`. Không gọi trực tiếp class `stt/jni` từ `api/` hoặc `websocket/`. Engine mới chọn bằng `stt.engine` (`@ConditionalOnProperty`, `jni` là mặc định) và phải qua `SpeechToTextEngineContract` trong test.
 - Mọi lời gọi JNI nặng CPU đều đi qua `CpuExecutionGate` để xếp hàng tuần tự và hỗ trợ hủy tức thì (`abort`) khi hết thời gian hoặc khi job bị xóa.
@@ -17,6 +17,7 @@ Nhận PCM qua WebSocket `/ws/stt` và trả JSON realtime. REST nằm dưới `
 - Phân loại lỗi từ engine trong `SessionPipeline`: `IllegalArgumentException` và `SpeechRecognitionException` là "từ chối một đầu vào", báo cho client (`invalid_audio`, `recognition_failed`) và giữ kết nối; mọi lỗi khác, kể cả `Error` từ native, đóng phiên với `engine_failure`.
 - Gửi tin nhắn WebSocket từ thread khác thread của container chỉ qua `ConcurrentWebSocketSessionDecorator` (đã làm trong handler).
 - Cấu hình đọc qua `@ConfigurationProperties`, không hard-code đường dẫn model hay giới hạn. Hai record cùng tiền tố `stt`: `SttProperties` (model, native, VAD, refiner, ffmpeg, job; chỉ sửa khi đổi phần JNI) và `RuntimeProperties` (chọn engine, `pool`, `session`, `websocket`, `mock`). Test dựng cấu hình bằng `TestSettings.properties(...)` và `TestSettings.runtime(...)`.
+- Xác thực chỉ ở `security/ApiKeyFilter` (khóa trong `stt.security.api-keys`, rỗng là tắt), áp cho `/api/**` và `/ws/**`. Không rải kiểm tra khóa vào controller hay handler. Bộ lọc xét đường dẫn theo `getServletPath()`, không phải `getRequestURI()`, để path parameter (`/api;x=1/...`) không qua mặt được.
 - Giao thức WebSocket và REST là hợp đồng với client Android: đổi thì cập nhật README, `.claude/skills/stt-backend/SKILL.md` và `SttEndToEndTest` cùng lúc. `/ws/stt` giữ nguyên đường dẫn.
 - File âm thanh dài luôn đọc theo cửa sổ trên đĩa qua `Wav`, không nạp toàn bộ PCM của file 1 giờ vào Java heap.
 - Thông báo lỗi trong code viết bằng tiếng Anh. Tài liệu và hướng dẫn cho người dùng viết bằng tiếng Việt.

@@ -114,7 +114,7 @@ Lỗi trả theo RFC 9457 (`application/problem+json`): `400` file sai định d
 | `/actuator/health` | Tổng hợp. Node đầy slot vẫn trả `200`, vì đầy là bận chứ không phải hỏng |
 | `/actuator/metrics`, `/actuator/prometheus` | Metrics (Prometheus scrape được) |
 
-Metrics riêng: `stt.sessions.active`, `stt.sessions.max`, `stt.sessions.rejected`, `stt.inference.workers`, `stt.inference.active`, `stt.inference.queued`, `stt.inference.duration`, `stt.queue.wait`. Chỉ số cần theo dõi nhất là `stt.queue.wait`: tăng nghĩa là máy đang quá tải.
+Metrics riêng: `stt.sessions.active`, `stt.sessions.max`, `stt.sessions.rejected`, `stt.inference.workers`, `stt.inference.active`, `stt.inference.queued`, `stt.inference.duration`, `stt.queue.wait`, `stt.auth.rejected`. Chỉ số cần theo dõi nhất là `stt.queue.wait`: tăng nghĩa là máy đang quá tải.
 
 ### WebSocket: `ws://<host>:8080/ws/stt?sampleRate=16000`
 
@@ -151,6 +151,25 @@ Kết nối không gửi gì trong `idle-timeout` (60 giây) bị đóng với m
 
 Với Android, `AudioRecord` ở `ENCODING_PCM_16BIT`, `CHANNEL_IN_MONO`, 16000 Hz đúng định dạng này, chỉ cần đẩy buffer vào frame nhị phân.
 
+### Xác thực (API key)
+
+Mặc định tắt: ai nối được vào máy chủ đều dùng được, phù hợp board trong mạng nội bộ. Để bật, đặt danh sách khóa (cách nhau bằng dấu phẩy):
+
+```
+STT_API_KEYS=khoa-cua-app-android,khoa-cua-nhom-ai ./gradlew bootRun
+```
+
+Khi bật, `/api/**` (cả `/api/stt` cũ) và `/ws/**` đòi khóa, gửi bằng một trong hai header:
+
+```
+Authorization: Bearer <khóa>
+X-Api-Key: <khóa>
+```
+
+Trình duyệt không đặt được header cho WebSocket, nên riêng `/ws/**` nhận thêm `?apiKey=<khóa>`. Khóa nằm trong URL có thể bị ghi lại ở proxy, nên client Android (đặt được header) hãy dùng header. Trang demo có ô "Khóa API" cho việc này.
+
+Thiếu hoặc sai khóa: REST trả `401` kèm `WWW-Authenticate: Bearer` và `application/problem+json`; WebSocket bị từ chối ngay ở bước bắt tay với `401`. Mỗi lần từ chối tăng metric `stt.auth.rejected`. `/actuator/**` và trang demo không cần khóa, vì probe không mang khóa. Khóa không mã hóa gì cả: ngoài mạng tin cậy, hãy đặt sau HTTPS.
+
 ## Đa luồng và sức chứa
 
 ```
@@ -178,6 +197,7 @@ Cấu hình trong `application.yml` (hoặc biến môi trường dạng `STT_PO
 | `stt.pool.max-sessions` | 0 (số worker nhân `sessionsPerWorker` của engine) | Số luồng tối đa cùng lúc. `jni` khai báo 1 mỗi worker, `mock` khai báo 4. Đây là mức thận trọng, hãy đo với dữ liệu thật rồi đặt lại (xem "Đo sức chứa thật") |
 | `stt.session.max-buffered-audio` | 30s | Âm thanh chờ tối đa của một client |
 | `stt.session.max-batch-audio` | 500ms | Âm thanh gộp tối đa mỗi lần gọi model |
+| `stt.security.api-keys` | rỗng (tắt) | Danh sách khóa API, biến môi trường `STT_API_KEYS`. Xem "Xác thực (API key)" |
 | `stt.websocket.allowed-origins` | `*` | Origin được phép. Giới hạn lại trước khi public |
 | `stt.websocket.max-frame-bytes` | 65536 | Kích thước frame nhị phân tối đa |
 | `stt.websocket.idle-timeout` | 60s | Ngắt kết nối im lặng |
@@ -218,6 +238,7 @@ com.bocbang.backend
 ├── api/              REST /api/v1 (và /api/stt cũ) và xử lý lỗi RFC 9457
 ├── websocket/        WebSocket /ws/stt: chỉ chuyển tin nhắn, không chạy model
 ├── runtime/          InferenceExecutor, SessionLimiter, SessionPipeline, RuntimeProperties, health indicator
+├── security/         ApiKeyFilter: khóa API cho /api và /ws (tắt khi không cấu hình khóa)
 └── stt/              Abstraction cho model nhận dạng
     ├── SpeechToTextEngine       engine dùng chung (model nạp một lần)
     ├── SpeechSession            một phiên realtime (mỗi kết nối một phiên)
@@ -240,5 +261,5 @@ Test chạy ngay không cần model: đơn vị cho runtime đa luồng, engine 
 - Spring Boot không chạy trực tiếp trong APK Android. Mô hình đúng là: app Android thu âm và gửi qua WebSocket tới server (board, PC, Raspberry Pi...).
 - `allowed-origins` đang là `*` để dev dễ. Trước khi public, đặt `stt.websocket.allowed-origins`.
 - Sau reverse proxy (nginx...), bật nâng cấp WebSocket (`Upgrade`/`Connection`) và đặt `proxy_read_timeout` lớn hơn `idle-timeout`. Trỏ readiness probe vào `/actuator/health/readiness`.
-- `/actuator` và trang demo chưa có xác thực. Đừng mở ra Internet khi chưa đặt sau proxy có kiểm soát truy cập.
+- Khóa API (`STT_API_KEYS`) chỉ bảo vệ `/api` và `/ws`. `/actuator` (kể cả metrics) và trang demo luôn mở, nên đừng mở máy chủ ra Internet khi chưa đặt sau proxy có kiểm soát truy cập và HTTPS.
 - RAM của board là giới hạn thật: model ASR ~1.3 GB, refiner ~2.5 GB, mỗi câu realtime giữ âm thanh trong heap tối đa `max-utterance-seconds`. Đặt `-Xmx` và `max-sessions` theo RAM thực tế.
