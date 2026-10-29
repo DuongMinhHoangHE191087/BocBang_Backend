@@ -1,5 +1,8 @@
 package com.bocbang.backend.websocket;
 
+import com.bocbang.backend.runtime.InferenceExecutor;
+import com.bocbang.backend.runtime.SessionLimiter;
+import com.bocbang.backend.runtime.SessionPipeline;
 import com.bocbang.backend.stt.SpeechSession;
 import com.bocbang.backend.stt.SpeechToTextEngine;
 import com.bocbang.backend.stt.SttProperties;
@@ -8,12 +11,19 @@ import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Optional;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.DisposableBean;
 import org.springframework.stereotype.Component;
 import org.springframework.web.socket.BinaryMessage;
 import org.springframework.web.socket.CloseStatus;
 import org.springframework.web.socket.TextMessage;
 import org.springframework.web.socket.WebSocketSession;
 import org.springframework.web.socket.handler.AbstractWebSocketHandler;
+import org.springframework.web.socket.handler.ConcurrentWebSocketSessionDecorator;
 import org.springframework.web.util.UriComponentsBuilder;
 import tools.jackson.core.JacksonException;
 import tools.jackson.databind.JsonNode;
@@ -25,23 +35,34 @@ import tools.jackson.databind.ObjectMapper;
  * <p>Client to server: binary frames of 16-bit little-endian mono PCM; text frame {@code {"type":"end"}}
  * to finish the current utterance.
  * <p>Server to client (JSON text): {@code ready} once on connect, then {@code partial} and {@code final}
- * transcripts, or {@code error}.
+ * transcripts (each with the server-side {@code lagMs}), or {@code error} with a machine-readable {@code code}.
+ *
+ * <p>This class only moves messages. Recognition runs on the shared inference threads through a
+ * {@link SessionPipeline}, so a connection never blocks a web server thread.
  */
 @Component
-public class SpeechWebSocketHandler extends AbstractWebSocketHandler {
+public class SpeechWebSocketHandler extends AbstractWebSocketHandler implements DisposableBean {
 
-    private static final String SESSION_ATTRIBUTE = "speechSession";
+    private static final Logger LOG = LoggerFactory.getLogger(SpeechWebSocketHandler.class);
+    private static final String CONNECTION_ATTRIBUTE = "speechConnection";
     private static final int MIN_SAMPLE_RATE = 8000;
     private static final int MAX_SAMPLE_RATE = 48000;
+    private static final int BYTES_PER_SAMPLE = 2;
 
     private static final ObjectMapper JSON = new ObjectMapper();
 
     private final SpeechToTextEngine engine;
     private final SttProperties properties;
+    private final SessionLimiter limiter;
+    private final InferenceExecutor executor;
+    private final Set<Connection> connections = ConcurrentHashMap.newKeySet();
 
-    public SpeechWebSocketHandler(SpeechToTextEngine engine, SttProperties properties) {
+    public SpeechWebSocketHandler(SpeechToTextEngine engine, SttProperties properties, SessionLimiter limiter,
+            InferenceExecutor executor) {
         this.engine = engine;
         this.properties = properties;
+        this.limiter = limiter;
+        this.executor = executor;
     }
 
     @Override
@@ -50,52 +71,119 @@ public class SpeechWebSocketHandler extends AbstractWebSocketHandler {
         try {
             sampleRate = requestedSampleRate(webSocket);
         } catch (IllegalArgumentException e) {
-            sendError(webSocket, e.getMessage());
-            webSocket.close(CloseStatus.POLICY_VIOLATION.withReason(e.getMessage()));
+            reject(webSocket, "invalid_sample_rate", e.getMessage(), CloseStatus.POLICY_VIOLATION);
             return;
         }
-        webSocket.getAttributes().put(SESSION_ATTRIBUTE, engine.openSession(sampleRate));
-        send(webSocket, Map.of(
+        Optional<SessionLimiter.Permit> permit = limiter.tryAcquire();
+        if (permit.isEmpty()) {
+            reject(webSocket, "capacity_exceeded", "Server is at capacity, retry shortly", CloseStatus.SERVICE_OVERLOAD);
+            return;
+        }
+        SpeechSession speech;
+        try {
+            speech = engine.openSession(sampleRate);
+        } catch (RuntimeException e) {
+            permit.get().close();
+            LOG.error("Cannot open a {} session", engine.name(), e);
+            reject(webSocket, "engine_failure", "Cannot start recognition", CloseStatus.SERVER_ERROR);
+            return;
+        }
+
+        SttProperties.WebSocket settings = properties.websocket();
+        WebSocketSession socket = new ConcurrentWebSocketSessionDecorator(
+                webSocket, (int) settings.sendTimeout().toMillis(), settings.sendBufferBytes());
+        SessionPipeline pipeline = new SessionPipeline(speech, executor, transcriptListener(socket),
+                audioBytes(sampleRate, properties.session().maxBufferedAudio().toMillis()),
+                (int) audioBytes(sampleRate, properties.session().maxBatchAudio().toMillis()));
+        Connection connection = new Connection(socket, pipeline, permit.get());
+        webSocket.getAttributes().put(CONNECTION_ATTRIBUTE, connection);
+        connections.add(connection);
+
+        send(socket, Map.of(
                 "type", "ready",
                 "sampleRate", sampleRate,
                 "encoding", "pcm_s16le",
-                "channels", 1));
+                "channels", 1,
+                "maxFrameBytes", settings.maxFrameBytes()));
     }
 
     @Override
-    protected void handleBinaryMessage(WebSocketSession webSocket, BinaryMessage message) throws IOException {
+    protected void handleBinaryMessage(WebSocketSession webSocket, BinaryMessage message) {
+        Connection connection = connection(webSocket);
+        if (connection == null) {
+            return;
+        }
         ByteBuffer payload = message.getPayload();
         byte[] pcm = new byte[payload.remaining()];
         payload.get(pcm);
-        if (pcm.length % 2 != 0) {
-            sendError(webSocket, "PCM 16-bit frames must have an even number of bytes");
+        if (pcm.length % BYTES_PER_SAMPLE != 0) {
+            sendError(connection.socket(), "invalid_frame", "PCM 16-bit frames must have an even number of bytes");
             return;
         }
-        speechSession(webSocket).accept(pcm, pcm.length)
-                .ifPresent(event -> sendTranscript(webSocket, event));
+        if (pcm.length > 0 && !connection.pipeline().offer(pcm)) {
+            sendError(connection.socket(), "overloaded", "Server cannot keep up with the audio stream");
+            close(connection.socket(), CloseStatus.SERVICE_OVERLOAD);
+        }
     }
 
     @Override
-    protected void handleTextMessage(WebSocketSession webSocket, TextMessage message) throws IOException {
+    protected void handleTextMessage(WebSocketSession webSocket, TextMessage message) {
+        Connection connection = connection(webSocket);
+        if (connection == null) {
+            return;
+        }
         JsonNode command;
         try {
             command = JSON.readTree(message.getPayload());
         } catch (JacksonException e) {
-            sendError(webSocket, "Text frame must be a JSON object");
+            sendError(connection.socket(), "invalid_command", "Text frame must be a JSON object");
             return;
         }
         if ("end".equals(command.path("type").asString(""))) {
-            sendTranscript(webSocket, speechSession(webSocket).finish());
+            connection.pipeline().finish();
         } else {
-            sendError(webSocket, "Unknown command, expected {\"type\":\"end\"}");
+            sendError(connection.socket(), "invalid_command", "Unknown command, expected {\"type\":\"end\"}");
         }
     }
 
     @Override
     public void afterConnectionClosed(WebSocketSession webSocket, CloseStatus status) {
-        if (webSocket.getAttributes().remove(SESSION_ATTRIBUTE) instanceof SpeechSession session) {
-            session.close();
+        if (webSocket.getAttributes().remove(CONNECTION_ATTRIBUTE) instanceof Connection connection) {
+            release(connection);
         }
+    }
+
+    @Override
+    public void destroy() {
+        for (Connection connection : connections) {
+            release(connection);
+            close(connection.socket(), CloseStatus.GOING_AWAY);
+        }
+    }
+
+    private void release(Connection connection) {
+        connections.remove(connection);
+        connection.pipeline().close();
+        connection.permit().close();
+    }
+
+    private SessionPipeline.Listener transcriptListener(WebSocketSession socket) {
+        return new SessionPipeline.Listener() {
+            @Override
+            public void onTranscript(TranscriptEvent event, long lagMillis) {
+                send(socket, Map.of(
+                        "type", event.type().name().toLowerCase(Locale.ROOT),
+                        "text", event.text(),
+                        "lagMs", lagMillis));
+            }
+
+            @Override
+            public void onFailure(Throwable cause) {
+                LOG.error("Recognition failed on session {}", socket.getId(), cause);
+                sendError(socket, "engine_failure", "Recognition failed");
+                close(socket, CloseStatus.SERVER_ERROR);
+            }
+        };
     }
 
     private int requestedSampleRate(WebSocketSession webSocket) {
@@ -106,7 +194,12 @@ public class SpeechWebSocketHandler extends AbstractWebSocketHandler {
         if (value == null) {
             return properties.defaultSampleRate();
         }
-        int sampleRate = Integer.parseInt(value);
+        int sampleRate;
+        try {
+            sampleRate = Integer.parseInt(value);
+        } catch (NumberFormatException e) {
+            throw new IllegalArgumentException("sampleRate must be a whole number");
+        }
         if (sampleRate < MIN_SAMPLE_RATE || sampleRate > MAX_SAMPLE_RATE) {
             throw new IllegalArgumentException(
                     "sampleRate must be between " + MIN_SAMPLE_RATE + " and " + MAX_SAMPLE_RATE);
@@ -114,25 +207,41 @@ public class SpeechWebSocketHandler extends AbstractWebSocketHandler {
         return sampleRate;
     }
 
-    private static SpeechSession speechSession(WebSocketSession webSocket) {
-        return (SpeechSession) webSocket.getAttributes().get(SESSION_ATTRIBUTE);
+    /** Bytes of 16-bit mono audio in the given time, rounded down to whole samples (at least one). */
+    private static long audioBytes(int sampleRate, long millis) {
+        return Math.max(BYTES_PER_SAMPLE, (sampleRate * (long) BYTES_PER_SAMPLE * millis / 1000) & ~1L);
     }
 
-    private static void sendTranscript(WebSocketSession webSocket, TranscriptEvent event) {
-        send(webSocket, Map.of(
-                "type", event.type().name().toLowerCase(Locale.ROOT),
-                "text", event.text()));
+    private static Connection connection(WebSocketSession webSocket) {
+        return webSocket.getAttributes().get(CONNECTION_ATTRIBUTE) instanceof Connection connection ? connection : null;
     }
 
-    private static void sendError(WebSocketSession webSocket, String message) {
-        send(webSocket, Map.of("type", "error", "message", message));
+    private static void reject(WebSocketSession webSocket, String code, String message, CloseStatus status) {
+        sendError(webSocket, code, message);
+        close(webSocket, status);
     }
 
+    private static void sendError(WebSocketSession webSocket, String code, String message) {
+        send(webSocket, Map.of("type", "error", "code", code, "message", message));
+    }
+
+    /** Sending can fail when the client is already gone; that is the close handler's business, not an error here. */
     private static void send(WebSocketSession webSocket, Map<String, ?> body) {
         try {
             webSocket.sendMessage(new TextMessage(JSON.writeValueAsString(body)));
-        } catch (IOException e) {
-            throw new IllegalStateException("Failed to send WebSocket message", e);
+        } catch (IOException | RuntimeException e) {
+            LOG.debug("Could not send to session {}: {}", webSocket.getId(), e.toString());
         }
+    }
+
+    private static void close(WebSocketSession webSocket, CloseStatus status) {
+        try {
+            webSocket.close(status);
+        } catch (IOException | RuntimeException e) {
+            LOG.debug("Could not close session {}: {}", webSocket.getId(), e.toString());
+        }
+    }
+
+    private record Connection(WebSocketSession socket, SessionPipeline pipeline, SessionLimiter.Permit permit) {
     }
 }

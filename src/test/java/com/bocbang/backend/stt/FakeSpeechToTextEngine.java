@@ -1,8 +1,8 @@
 package com.bocbang.backend.stt;
 
-import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /** Engine that returns a fixed transcript, so tests do not need a model on disk. */
@@ -10,7 +10,7 @@ public class FakeSpeechToTextEngine implements SpeechToTextEngine {
 
     private final String transcript;
 
-    public final List<Integer> openedSampleRates = new ArrayList<>();
+    public final List<Integer> openedSampleRates = new CopyOnWriteArrayList<>();
     public final AtomicInteger receivedBytes = new AtomicInteger();
     public final AtomicInteger closedSessions = new AtomicInteger();
 

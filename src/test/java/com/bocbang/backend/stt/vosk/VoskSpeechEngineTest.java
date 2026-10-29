@@ -2,8 +2,8 @@ package com.bocbang.backend.stt.vosk;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
+import com.bocbang.backend.TestSettings;
 import com.bocbang.backend.stt.SpeechSession;
-import com.bocbang.backend.stt.SttProperties;
 import com.bocbang.backend.stt.TranscriptEvent;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -18,8 +18,7 @@ class VoskSpeechEngineTest {
     @Test
     @EnabledIf("modelIsInstalled")
     void recognizesSilenceWithoutErrors() throws Exception {
-        try (VoskSpeechEngine engine = new VoskSpeechEngine(
-                new SttProperties(16000, new SttProperties.Vosk(MODEL_PATH)));
+        try (VoskSpeechEngine engine = new VoskSpeechEngine(TestSettings.properties("vosk.model-path", MODEL_PATH));
              SpeechSession session = engine.openSession(16000)) {
             byte[] oneSecondOfSilence = new byte[16000 * 2];
 

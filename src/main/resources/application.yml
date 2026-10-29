@@ -5,12 +5,48 @@ spring:
     multipart:
       max-file-size: 20MB
       max-request-size: 20MB
+  lifecycle:
+    timeout-per-shutdown-phase: 20s
 
 server:
   port: 8080
+  shutdown: graceful
+  tomcat:
+    # WebSocket connections idle on the NIO poller, not on a thread each; inference runs on its own pool (stt.pool).
+    threads:
+      max: 200
+    max-connections: 8192
+    accept-count: 100
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,prometheus
+  endpoint:
+    health:
+      probes:
+        enabled: true
+      show-details: always
+      group:
+        # Readiness reports OUT_OF_SERVICE while every stream slot is taken; liveness never depends on load.
+        readiness:
+          include: readinessState,stt
 
 stt:
+  # vosk (default) or mock. A new engine registers itself for its own name, see README.
+  engine: ${STT_ENGINE:vosk}
   default-sample-rate: 16000
   vosk:
     # Relative to the working directory. Download: https://alphacephei.com/vosk/models (Vietnamese: vosk-model-small-vn-0.4)
     model-path: ${STT_VOSK_MODEL_PATH:models/vosk-model-small-vn-0.4}
+  # pool:
+  #   workers: 0        # inference threads; 0 = CPU count - 1
+  #   max-sessions: 0   # concurrent streams; 0 = 4 per worker. Measure with the real model, then set it.
+  # session:
+  #   max-buffered-audio: 5s
+  #   max-batch-audio: 500ms
+  # websocket:
+  #   allowed-origins: https://app.example.com
+  #   max-frame-bytes: 65536
+  #   idle-timeout: 60s

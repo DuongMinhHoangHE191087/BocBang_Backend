@@ -7,6 +7,7 @@ import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.stereotype.Component;
 import org.vosk.LibVosk;
 import org.vosk.LogLevel;
@@ -15,6 +16,7 @@ import org.vosk.Recognizer;
 
 /** Offline CPU speech recognition with Vosk. The loaded model is shared; each session owns a Recognizer. */
 @Component
+@ConditionalOnProperty(prefix = "stt", name = "engine", havingValue = "vosk", matchIfMissing = true)
 public class VoskSpeechEngine implements SpeechToTextEngine, AutoCloseable {
 
     private final Model model;

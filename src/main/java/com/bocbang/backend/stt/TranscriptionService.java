@@ -1,10 +1,15 @@
 package com.bocbang.backend.stt;
 
+import com.bocbang.backend.runtime.CapacityExceededException;
+import com.bocbang.backend.runtime.InferenceExecutor;
+import com.bocbang.backend.runtime.SessionLimiter;
+import java.io.BufferedInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.concurrent.Callable;
 import java.util.stream.Collectors;
 import javax.sound.sampled.AudioFormat;
 import javax.sound.sampled.AudioInputStream;
@@ -12,21 +17,35 @@ import javax.sound.sampled.AudioSystem;
 import javax.sound.sampled.UnsupportedAudioFileException;
 import org.springframework.stereotype.Service;
 
-/** Runs a complete audio file through the same streaming engine used by the WebSocket. */
+/**
+ * Runs a complete audio file through the same streaming engine used by the WebSocket. It takes a recognition slot
+ * and runs on the shared inference threads, one chunk at a time, so a long upload shares the CPU fairly with
+ * live streams instead of crowding them out.
+ */
 @Service
 public class TranscriptionService {
 
-    /** 250 ms of 16 kHz 16-bit mono audio per engine call. */
-    private static final int CHUNK_BYTES = 8000;
+    private static final int BYTES_PER_SAMPLE = 2;
 
     private final SpeechToTextEngine engine;
+    private final SessionLimiter limiter;
+    private final InferenceExecutor executor;
 
-    public TranscriptionService(SpeechToTextEngine engine) {
+    public TranscriptionService(SpeechToTextEngine engine, SessionLimiter limiter, InferenceExecutor executor) {
         this.engine = engine;
+        this.limiter = limiter;
+        this.executor = executor;
     }
 
+    /**
+     * @throws IllegalArgumentException if the input is not a 16-bit little-endian mono PCM WAV
+     * @throws CapacityExceededException if every recognition slot is taken
+     */
     public Transcription transcribeWav(InputStream wav) throws IOException {
-        try (AudioInputStream audio = AudioSystem.getAudioInputStream(wav)) {
+        byte[] pcm;
+        int sampleRate;
+        // AudioSystem sniffs the format with mark/reset, which uploaded-file streams do not support.
+        try (AudioInputStream audio = AudioSystem.getAudioInputStream(new BufferedInputStream(wav))) {
             AudioFormat format = audio.getFormat();
             if (format.getEncoding() != AudioFormat.Encoding.PCM_SIGNED
                     || format.getSampleSizeInBits() != 16
@@ -34,31 +53,51 @@ public class TranscriptionService {
                     || format.isBigEndian()) {
                 throw new IllegalArgumentException("Only 16-bit little-endian PCM mono WAV is supported");
             }
-            int sampleRate = Math.round(format.getSampleRate());
-            byte[] pcm = audio.readAllBytes();
-            return new Transcription(transcribePcm(pcm, sampleRate), sampleRate);
+            sampleRate = Math.round(format.getSampleRate());
+            pcm = audio.readAllBytes();
         } catch (UnsupportedAudioFileException e) {
             throw new IllegalArgumentException("File is not a valid WAV audio", e);
+        }
+        try (SessionLimiter.Permit ignored = limiter.tryAcquire()
+                .orElseThrow(() -> new CapacityExceededException("All recognition slots are busy"))) {
+            String text = transcribePcm(pcm, sampleRate);
+            long durationMillis = pcm.length * 1000L / ((long) sampleRate * BYTES_PER_SAMPLE);
+            return new Transcription(text, sampleRate, durationMillis);
         }
     }
 
     private String transcribePcm(byte[] pcm, int sampleRate) {
+        // 250 ms of audio per engine call, kept sample-aligned.
+        int chunkBytes = sampleRate * BYTES_PER_SAMPLE / 4 & ~1;
         List<String> utterances = new ArrayList<>();
         try (SpeechSession session = engine.openSession(sampleRate)) {
-            for (int offset = 0; offset < pcm.length; offset += CHUNK_BYTES) {
-                int length = Math.min(CHUNK_BYTES, pcm.length - offset);
+            for (int offset = 0; offset < pcm.length; offset += chunkBytes) {
+                int length = Math.min(chunkBytes, pcm.length - offset);
                 byte[] chunk = Arrays.copyOfRange(pcm, offset, offset + length);
-                session.accept(chunk, length)
+                onInferenceThread(() -> session.accept(chunk, length))
                         .filter(event -> event.type() == TranscriptEvent.Type.FINAL)
                         .ifPresent(event -> utterances.add(event.text()));
             }
-            utterances.add(session.finish().text());
+            utterances.add(onInferenceThread(session::finish).text());
         }
         return utterances.stream()
                 .filter(text -> !text.isBlank())
                 .collect(Collectors.joining(" "));
     }
 
-    public record Transcription(String text, int sampleRate) {
+    private <T> T onInferenceThread(Callable<T> task) {
+        try {
+            return executor.call(task);
+        } catch (RuntimeException e) {
+            throw e;
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException("Interrupted while transcribing", e);
+        } catch (Exception e) {
+            throw new IllegalStateException("Transcription failed", e);
+        }
+    }
+
+    public record Transcription(String text, int sampleRate, long durationMillis) {
     }
 }

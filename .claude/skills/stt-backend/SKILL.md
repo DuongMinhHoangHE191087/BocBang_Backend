@@ -1,6 +1,6 @@
 ---
 name: stt-backend
-description: Kiến trúc và protocol của BocBang Backend (Spring Boot 4 + Vosk). Dùng khi sửa WebSocket /ws/stt, REST /api/stt, engine nhận dạng giọng nói, hoặc viết client Android gửi âm thanh.
+description: Kiến trúc và protocol của BocBang Backend (Spring Boot 4 + engine nhận dạng cắm được, mặc định Vosk). Dùng khi sửa WebSocket /ws/stt, REST /api/v1/stt, runtime đa luồng, engine nhận dạng giọng nói, web demo, hoặc viết client Android gửi âm thanh.
 ---
 
 # BocBang STT backend
@@ -8,26 +8,38 @@ description: Kiến trúc và protocol của BocBang Backend (Spring Boot 4 + Vo
 ## Luồng dữ liệu
 
 1. Client (Android `AudioRecord`, PCM 16-bit mono) mở `ws://<host>:8080/ws/stt?sampleRate=16000`.
-2. Server gửi `{"type":"ready",...}`.
-3. Client gửi binary frame PCM mỗi 100–250 ms. Server trả `partial` khi văn bản thay đổi và `final` khi model kết thúc một câu.
+2. Server gửi `{"type":"ready",...,"maxFrameBytes":65536}`. Hết chỗ thì gửi `{"type":"error","code":"capacity_exceeded"}` rồi đóng mã 1013.
+3. Client gửi binary frame PCM mỗi 100 ms. Server trả `partial` khi văn bản thay đổi và `final` khi model kết thúc một câu, mỗi tin có `lagMs`.
 4. Client gửi text `{"type":"end"}` để chốt câu cuối. Server trả `final`.
+
+Lỗi luôn có `code` (`invalid_sample_rate`, `capacity_exceeded`, `overloaded`, `invalid_frame`, `invalid_command`, `engine_failure`). Bảng hành vi đầy đủ trong README.md.
+
+## Đường đi của một frame
+
+`SpeechWebSocketHandler` (thread web) → `SessionPipeline.offer` (hàng đợi riêng của kết nối) → `InferenceExecutor` (bộ thread cố định) → `SpeechSession.accept` → `Listener` gửi `partial/final` qua `ConcurrentWebSocketSessionDecorator`. REST upload file đi qua cùng `SessionLimiter` và `InferenceExecutor` (`TranscriptionService`).
 
 ## Chỗ cần sửa khi làm việc với từng phần
 
-- Thêm model khác: implement `SpeechToTextEngine` và `SpeechSession` trong `stt/`, đăng ký làm `@Component`. Không sửa `websocket/` hay `api/`.
-- Đổi protocol: `websocket/SpeechWebSocketHandler.java`. Cập nhật luôn bảng trong README.md.
+- Thêm model khác: implement `SpeechToTextEngine` và `SpeechSession` trong package `stt/<tên>/`, `@Component` + `@ConditionalOnProperty(prefix = "stt", name = "engine", havingValue = "<tên>")`, thêm test kế thừa `SpeechToTextEngineContract`. Không sửa `websocket/` hay `api/`.
+- Đổi protocol WebSocket: `websocket/SpeechWebSocketHandler.java`, cập nhật README.md, `SttEndToEndTest`, `tools/load-test.mjs` nếu đổi tin nhắn, và `static/app.js`.
+- Đổi hành vi đa luồng, hàng đợi, backpressure: `runtime/SessionPipeline.java` (có `SessionPipelineTest`).
+- Giới hạn tải và cấu hình: `stt/SttProperties.java`, `application.yml`.
+- Đổi REST: `api/SttController.java`, lỗi trong `api/ApiExceptionHandler.java` (RFC 9457). Đường dẫn có tiền tố `/api/v1`.
 - Đổi cách đọc file: `stt/TranscriptionService.java` (chỉ nhận WAV 16-bit PCM mono).
-- Cấu hình model: `stt.vosk.model-path` trong `application.yml`, hoặc biến `STT_VOSK_MODEL_PATH`.
+- Web demo: `src/main/resources/static/` (`index.html`, `app.css`, `app.js`, `pcm-worklet.js`), không dùng CDN hay bước build.
+- Chọn engine: `STT_ENGINE=vosk|mock`. Đường dẫn model Vosk: `stt.vosk.model-path` hoặc `STT_VOSK_MODEL_PATH`.
 
 ## Ràng buộc đã biết
 
-- `SpeechSession` không thread-safe. Handler WebSocket gọi tuần tự cho từng kết nối; đừng gọi từ thread khác.
-- Model Vosk được nạp một lần khi khởi động. Nếu thiếu thư mục model, server dừng ngay với thông báo đường dẫn.
-- Vosk chạy trên CPU ngay trong thread của WebSocket. Với nhiều kết nối đồng thời, cần đo lại trước khi đẩy sang executor riêng.
-- Server không xử lý Android APK. Backend chạy trên PC/server, app Android là client.
+- `SpeechSession` không thread-safe. `SessionPipeline` bảo đảm một thread tại một thời điểm, theo đúng thứ tự đến, nhưng các lần gọi có thể đến từ các worker khác nhau (không dùng `ThreadLocal`).
+- Model Vosk được nạp một lần khi khởi động. Nếu thiếu thư mục model, server dừng ngay với thông báo đường dẫn (dùng `STT_ENGINE=mock` để chạy khi chưa có model).
+- Số luồng tối đa mặc định là 4 mỗi worker, chỉ là ước lượng. Phải đo bằng model thật (`tools/load-test.mjs` và chỉ số `stt.queue.wait`) rồi đặt `stt.pool.max-sessions`.
+- Container WebSocket mặc định chỉ nhận frame nhị phân 8 KB; `WebSocketConfig` nâng lên `stt.websocket.max-frame-bytes`.
+- Máy chủ chỉ chạy trên PC/server. App Android là client, không chạy Spring Boot trong APK.
+- `AudioSystem.getAudioInputStream` cần luồng hỗ trợ mark/reset, nên `TranscriptionService` bọc `BufferedInputStream`.
 
 ## Kiểm tra
 
-- Test không cần model: `./gradlew test` (dùng `FakeSpeechToTextEngine`).
+- Test không cần model: `test --no-daemon` qua `~/.claude/scripts/jvm-ondemand.ps1` (xem CLAUDE.md của dự án). Gồm `SttEndToEndTest` chạy cả server thật trên cổng ngẫu nhiên.
 - Test với model thật tự bật khi có thư mục `models/vosk-model-small-vn-0.4`.
-- Trên máy dev, Gradle phải chạy qua `~/.claude/scripts/jvm-ondemand.ps1` (xem CLAUDE.md của dự án).
+- Thử tay: chạy server với `STT_ENGINE=mock`, mở `http://localhost:8080/`, hoặc `node tools/load-test.mjs`.

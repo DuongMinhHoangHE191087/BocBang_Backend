@@ -13,6 +13,7 @@ final class VoskSpeechSession implements SpeechSession {
 
     private final Recognizer recognizer;
     private String lastPartial = "";
+    private boolean closed;
 
     VoskSpeechSession(Recognizer recognizer) {
         this.recognizer = recognizer;
@@ -42,6 +43,11 @@ final class VoskSpeechSession implements SpeechSession {
 
     @Override
     public void close() {
+        // Freeing the native recognizer twice would crash the JVM.
+        if (closed) {
+            return;
+        }
+        closed = true;
         recognizer.close();
     }
 
