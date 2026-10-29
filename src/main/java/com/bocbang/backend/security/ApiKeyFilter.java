@@ -51,7 +51,9 @@ public class ApiKeyFilter extends OncePerRequestFilter {
 
     @Override
     protected boolean shouldNotFilter(HttpServletRequest request) {
-        return keys.isEmpty() || !isProtected(path(request));
+        return keys.isEmpty()
+                || "OPTIONS".equalsIgnoreCase(request.getMethod())
+                || !isProtected(path(request));
     }
 
     @Override

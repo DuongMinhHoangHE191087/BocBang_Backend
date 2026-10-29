@@ -11,7 +11,8 @@ spring:
     timeout-per-shutdown-phase: 20s
 
 server:
-  port: 8080
+  address: ${SERVER_ADDRESS:0.0.0.0}
+  port: ${SERVER_PORT:8099}
   shutdown: graceful
   tomcat:
     # WebSocket connections idle on the NIO poller, not on a thread each; inference runs on its own pool (stt.pool).
