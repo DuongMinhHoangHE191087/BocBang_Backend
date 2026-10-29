@@ -28,10 +28,18 @@ management:
       probes:
         enabled: true
       show-details: always
+      status:
+        # BUSY (every stream slot taken) ranks below UP here, so /actuator/health stays 200 on a busy node.
+        order: DOWN,OUT_OF_SERVICE,UP,BUSY,UNKNOWN
       group:
-        # Readiness reports OUT_OF_SERVICE while every stream slot is taken; liveness never depends on load.
+        # Readiness ranks BUSY above UP and answers 503 for it, so load balancers stop sending new streams;
+        # liveness never depends on load.
         readiness:
           include: readinessState,stt
+          status:
+            order: DOWN,OUT_OF_SERVICE,BUSY,UP,UNKNOWN
+            http-mapping:
+              BUSY: 503
 
 stt:
   # vosk (default) or mock. A new engine registers itself for its own name, see README.
@@ -42,7 +50,7 @@ stt:
     model-path: ${STT_VOSK_MODEL_PATH:models/vosk-model-small-vn-0.4}
   # pool:
   #   workers: 0        # inference threads; 0 = CPU count - 1
-  #   max-sessions: 0   # concurrent streams; 0 = 4 per worker. Measure with the real model, then set it.
+  #   max-sessions: 0   # concurrent streams; 0 = workers x the engine's streams per worker (vosk 1, mock 4). Measure with the real model, then set it.
   # session:
   #   max-buffered-audio: 5s
   #   max-batch-audio: 500ms

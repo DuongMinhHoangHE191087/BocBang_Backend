@@ -23,6 +23,8 @@ final class RecordingSession implements SpeechSession {
     /** When set, {@link #accept} waits on it, so a test can hold the session busy. */
     volatile CountDownLatch gate;
     volatile RuntimeException failure;
+    /** Thrown from {@link #accept} like a failure, but as an Error, the way a broken native library behaves. */
+    volatile Error error;
     volatile Runnable onAccept;
 
     private final AtomicInteger busy = new AtomicInteger();
@@ -38,6 +40,9 @@ final class RecordingSession implements SpeechSession {
                 hook.run();
             }
             awaitGate();
+            if (error != null) {
+                throw error;
+            }
             if (failure != null) {
                 throw failure;
             }

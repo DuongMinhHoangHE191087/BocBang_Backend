@@ -256,7 +256,8 @@
     };
   }
 
-  const run = { active: false, connections: [], source: null, startedAt: 0, frames: 0, lags: [], lagMax: 0 };
+  const LAG_WINDOW = 20;
+  const run = { active: false, connections: [], source: null, startedAt: 0, frames: 0, recentLags: [], lagMax: 0 };
   const tiles = new Map();
 
   function setStatus(text, isError = false) {
@@ -270,9 +271,9 @@
   };
 
   function renderStats() {
-    const recent = run.lags.slice(-20);
+    const recent = run.recentLags;
     el.statLag.textContent = recent.length ? `${Math.round(recent.reduce((a, b) => a + b, 0) / recent.length)} ms` : '-';
-    el.statLagMax.textContent = run.lags.length ? `${run.lagMax} ms` : '-';
+    el.statLagMax.textContent = recent.length ? `${run.lagMax} ms` : '-';
     el.statFrames.textContent = String(run.frames);
     el.statOpen.textContent = String(run.connections.filter((c) => c.ready).length);
   }
@@ -320,7 +321,10 @@
   function handlersFor(id) {
     return {
       onTranscript(message) {
-        run.lags.push(message.lagMs);
+        run.recentLags.push(message.lagMs);
+        if (run.recentLags.length > LAG_WINDOW) {
+          run.recentLags.shift();
+        }
         run.lagMax = Math.max(run.lagMax, message.lagMs);
         setTile(id, 'live', 'Đang nghe', message.text, message.lagMs);
         if (id === 0) {
@@ -355,7 +359,7 @@
     el.clients.textContent = '';
     tiles.clear();
     ribbon.reset();
-    Object.assign(run, { frames: 0, lags: [], lagMax: 0, connections: [] });
+    Object.assign(run, { frames: 0, recentLags: [], lagMax: 0, connections: [] });
     renderStats();
   }
 

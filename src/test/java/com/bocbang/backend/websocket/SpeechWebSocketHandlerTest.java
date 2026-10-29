@@ -17,6 +17,7 @@ import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import java.net.URI;
 import java.util.HashMap;
 import java.util.List;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
@@ -65,6 +66,22 @@ class SpeechWebSocketHandlerTest {
 
         await().atMost(5, TimeUnit.SECONDS).until(() -> engine.closedSessions.get() == 1);
         assertThat(limiter.active()).isZero();
+    }
+
+    @Test
+    void keepsTheSlotTakenUntilTheRecognizerIsReallyClosed() throws Exception {
+        SpeechWebSocketHandler handler = handler(TestSettings.properties());
+        WebSocketSession webSocket = webSocket("ws://localhost/ws/stt");
+        handler.afterConnectionEstablished(webSocket);
+        CountDownLatch release = blockWorkers(2);
+
+        handler.afterConnectionClosed(webSocket, CloseStatus.NORMAL);
+
+        assertThat(limiter.active()).as("the recognizer still exists, so the slot is not free").isEqualTo(1);
+        assertThat(engine.closedSessions.get()).isZero();
+        release.countDown();
+        await().atMost(5, TimeUnit.SECONDS).until(() -> engine.closedSessions.get() == 1);
+        await().atMost(5, TimeUnit.SECONDS).until(() -> limiter.active() == 0);
     }
 
     @Test
@@ -128,6 +145,24 @@ class SpeechWebSocketHandlerTest {
 
     private SpeechWebSocketHandler handler(SttProperties properties) {
         return new SpeechWebSocketHandler(engine, properties, limiter, executor);
+    }
+
+    /** Occupies every inference thread so queued work, such as closing a session, cannot start. */
+    private CountDownLatch blockWorkers(int workers) throws InterruptedException {
+        CountDownLatch release = new CountDownLatch(1);
+        CountDownLatch started = new CountDownLatch(workers);
+        for (int i = 0; i < workers; i++) {
+            executor.execute(() -> {
+                started.countDown();
+                try {
+                    release.await(10, TimeUnit.SECONDS);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            });
+        }
+        assertThat(started.await(5, TimeUnit.SECONDS)).isTrue();
+        return release;
     }
 
     private static WebSocketSession webSocket(String uri) {

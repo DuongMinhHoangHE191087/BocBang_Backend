@@ -31,6 +31,7 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.context.TestConfiguration;
+import org.springframework.context.ConfigurableApplicationContext;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Import;
 
@@ -54,6 +55,9 @@ class SttEndToEndTest {
 
     @Autowired
     SessionLimiter limiter;
+
+    @Autowired
+    ConfigurableApplicationContext context;
 
     private final HttpClient http = HttpClient.newHttpClient();
 
@@ -100,6 +104,7 @@ class SttEndToEndTest {
             }
             assertThat(get("/actuator/health/readiness").statusCode()).isEqualTo(503);
             assertThat(get("/actuator/health/liveness").statusCode()).isEqualTo(200);
+            assertThat(get("/actuator/health").statusCode()).as("a busy node is not a broken one").isEqualTo(200);
 
             Client overflow = connect("/ws/stt");
             overflow.awaitMessage("\"code\":\"capacity_exceeded\"");
@@ -166,6 +171,11 @@ class SttEndToEndTest {
         assertThat(notWav.headers().firstValue("Content-Type").orElse("")).contains("application/problem+json");
         assertThat(notMultipart.statusCode()).isEqualTo(415);
         assertThat(notMultipart.headers().firstValue("Content-Type").orElse("")).contains("application/problem+json");
+    }
+
+    @Test
+    void shutsTheInferenceExecutorDownBeforeTheEngineItRuns() {
+        assertThat(context.getBeanFactory().getDependentBeans("fakeEngine")).contains("inferenceExecutor");
     }
 
     @Test

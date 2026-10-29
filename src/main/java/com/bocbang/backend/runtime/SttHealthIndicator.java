@@ -6,8 +6,9 @@ import org.springframework.boot.health.contributor.HealthIndicator;
 import org.springframework.stereotype.Component;
 
 /**
- * Part of the readiness group only: a full server reports OUT_OF_SERVICE so a load balancer sends new clients
- * elsewhere, while liveness stays UP so the process is not restarted just for being busy.
+ * Reports BUSY while every stream slot is taken. {@code application.yml} ranks BUSY below UP for the main health
+ * endpoint, so a monitor sees a busy node as healthy, and above UP for the readiness group, so a load balancer
+ * sends new clients elsewhere. Liveness never includes this indicator.
  */
 @Component("stt")
 class SttHealthIndicator implements HealthIndicator {
@@ -24,7 +25,7 @@ class SttHealthIndicator implements HealthIndicator {
 
     @Override
     public Health health() {
-        Health.Builder health = limiter.isFull() ? Health.outOfService() : Health.up();
+        Health.Builder health = limiter.isFull() ? Health.status("BUSY") : Health.up();
         return health
                 .withDetail("engine", engine.name())
                 .withDetail("activeSessions", limiter.active())

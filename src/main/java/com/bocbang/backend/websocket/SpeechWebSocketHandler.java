@@ -3,6 +3,7 @@ package com.bocbang.backend.websocket;
 import com.bocbang.backend.runtime.InferenceExecutor;
 import com.bocbang.backend.runtime.SessionLimiter;
 import com.bocbang.backend.runtime.SessionPipeline;
+import com.bocbang.backend.stt.SampleRates;
 import com.bocbang.backend.stt.SpeechSession;
 import com.bocbang.backend.stt.SpeechToTextEngine;
 import com.bocbang.backend.stt.SttProperties;
@@ -45,8 +46,6 @@ public class SpeechWebSocketHandler extends AbstractWebSocketHandler implements 
 
     private static final Logger LOG = LoggerFactory.getLogger(SpeechWebSocketHandler.class);
     private static final String CONNECTION_ATTRIBUTE = "speechConnection";
-    private static final int MIN_SAMPLE_RATE = 8000;
-    private static final int MAX_SAMPLE_RATE = 48000;
     private static final int BYTES_PER_SAMPLE = 2;
 
     private static final ObjectMapper JSON = new ObjectMapper();
@@ -92,10 +91,10 @@ public class SpeechWebSocketHandler extends AbstractWebSocketHandler implements 
         SttProperties.WebSocket settings = properties.websocket();
         WebSocketSession socket = new ConcurrentWebSocketSessionDecorator(
                 webSocket, (int) settings.sendTimeout().toMillis(), settings.sendBufferBytes());
-        SessionPipeline pipeline = new SessionPipeline(speech, executor, transcriptListener(socket),
+        SessionPipeline pipeline = new SessionPipeline(speech, executor, transcriptListener(socket, permit.get()),
                 audioBytes(sampleRate, properties.session().maxBufferedAudio().toMillis()),
                 (int) audioBytes(sampleRate, properties.session().maxBatchAudio().toMillis()));
-        Connection connection = new Connection(socket, pipeline, permit.get());
+        Connection connection = new Connection(socket, pipeline);
         webSocket.getAttributes().put(CONNECTION_ATTRIBUTE, connection);
         connections.add(connection);
 
@@ -161,13 +160,13 @@ public class SpeechWebSocketHandler extends AbstractWebSocketHandler implements 
         }
     }
 
+    /** The stream's slot is given back by the pipeline once its recognizer is really closed, not before. */
     private void release(Connection connection) {
         connections.remove(connection);
         connection.pipeline().close();
-        connection.permit().close();
     }
 
-    private SessionPipeline.Listener transcriptListener(WebSocketSession socket) {
+    private SessionPipeline.Listener transcriptListener(WebSocketSession socket, SessionLimiter.Permit permit) {
         return new SessionPipeline.Listener() {
             @Override
             public void onTranscript(TranscriptEvent event, long lagMillis) {
@@ -182,6 +181,11 @@ public class SpeechWebSocketHandler extends AbstractWebSocketHandler implements 
                 LOG.error("Recognition failed on session {}", socket.getId(), cause);
                 sendError(socket, "engine_failure", "Recognition failed");
                 close(socket, CloseStatus.SERVER_ERROR);
+            }
+
+            @Override
+            public void onClosed() {
+                permit.close();
             }
         };
     }
@@ -200,9 +204,9 @@ public class SpeechWebSocketHandler extends AbstractWebSocketHandler implements 
         } catch (NumberFormatException e) {
             throw new IllegalArgumentException("sampleRate must be a whole number");
         }
-        if (sampleRate < MIN_SAMPLE_RATE || sampleRate > MAX_SAMPLE_RATE) {
+        if (!SampleRates.isSupported(sampleRate)) {
             throw new IllegalArgumentException(
-                    "sampleRate must be between " + MIN_SAMPLE_RATE + " and " + MAX_SAMPLE_RATE);
+                    "sampleRate must be between " + SampleRates.MIN + " and " + SampleRates.MAX);
         }
         return sampleRate;
     }
@@ -242,6 +246,6 @@ public class SpeechWebSocketHandler extends AbstractWebSocketHandler implements 
         }
     }
 
-    private record Connection(WebSocketSession socket, SessionPipeline pipeline, SessionLimiter.Permit permit) {
+    private record Connection(WebSocketSession socket, SessionPipeline pipeline) {
     }
 }

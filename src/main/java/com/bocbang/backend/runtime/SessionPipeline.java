@@ -26,6 +26,10 @@ public final class SessionPipeline {
 
         /** The engine failed. The pipeline stops feeding the session; the owner should close it. */
         void onFailure(Throwable cause);
+
+        /** The session has been closed and nothing will use it again, so what it held can be given back. */
+        default void onClosed() {
+        }
     }
 
     private interface Task {
@@ -51,6 +55,8 @@ public final class SessionPipeline {
     private final AtomicBoolean closing = new AtomicBoolean();
     /** Held by whoever may touch the session: set while a drain is scheduled or running. */
     private final AtomicBoolean running = new AtomicBoolean();
+    /** True while the newest queued task is a Finish: another end with no audio after it would add nothing. */
+    private final AtomicBoolean tailIsFinish = new AtomicBoolean();
     private volatile boolean failed;
     private boolean sessionClosed;
 
@@ -76,13 +82,20 @@ public final class SessionPipeline {
             return false;
         }
         queue.add(new Audio(pcm, System.nanoTime()));
+        tailIsFinish.set(false);
         schedule();
         return true;
     }
 
-    /** Queues the end of the current utterance; its final transcript goes to the listener after queued audio. */
+    /**
+     * Queues the end of the current utterance; its final transcript goes to the listener after queued audio. Ends
+     * that arrive back to back, with no audio between them, share one final transcript.
+     */
     public void finish() {
         if (closing.get() || failed) {
+            return;
+        }
+        if (!tailIsFinish.compareAndSet(false, true)) {
             return;
         }
         queue.add(new Finish(System.nanoTime()));
@@ -122,6 +135,9 @@ public final class SessionPipeline {
             if (task instanceof Audio audio) {
                 feed(audio);
             } else if (task instanceof Finish finish) {
+                if (queue.isEmpty()) {
+                    tailIsFinish.set(false);
+                }
                 finishUtterance(finish);
             } else if (task == CLOSE) {
                 queue.clear();
@@ -157,7 +173,8 @@ public final class SessionPipeline {
         try {
             session.accept(pcm, pcm.length)
                     .ifPresent(event -> listener.onTranscript(event, millisSince(first.enqueuedNanos())));
-        } catch (RuntimeException e) {
+        } catch (RuntimeException | Error e) {
+            // A native engine fails with Errors (UnsatisfiedLinkError, OutOfMemoryError); the client must still hear it.
             fail(e);
         }
     }
@@ -169,7 +186,7 @@ public final class SessionPipeline {
         try {
             TranscriptEvent result = session.finish();
             listener.onTranscript(result, millisSince(finish.enqueuedNanos()));
-        } catch (RuntimeException e) {
+        } catch (RuntimeException | Error e) {
             fail(e);
         }
     }
@@ -183,6 +200,16 @@ public final class SessionPipeline {
             session.close();
         } catch (RuntimeException e) {
             // Nothing left to do for a session that failed to close; the connection is already gone.
+        } finally {
+            notifyClosed();
+        }
+    }
+
+    private void notifyClosed() {
+        try {
+            listener.onClosed();
+        } catch (RuntimeException e) {
+            // Whatever the listener held is the listener's to clean up; the session is gone either way.
         }
     }
 

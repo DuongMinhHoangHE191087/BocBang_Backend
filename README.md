@@ -43,7 +43,7 @@ Mở `http://localhost:8080/`.
 | Method | Đường dẫn | Mô tả |
 |---|---|---|
 | GET | `/api/v1/stt/status` | Engine, đường dẫn WebSocket, sức chứa và tải hiện tại, `ready` |
-| POST | `/api/v1/stt/transcriptions` | Multipart `file` là WAV 16-bit PCM mono, trả `{"text","sampleRate","durationMs"}` |
+| POST | `/api/v1/stt/transcriptions` | Multipart `file` là WAV 16-bit PCM mono, tần số lấy mẫu 8000–48000, trả `{"text","sampleRate","durationMs"}` |
 
 ```
 curl -F "file=@sample.wav" http://localhost:8080/api/v1/stt/transcriptions
@@ -56,7 +56,8 @@ Lỗi trả theo RFC 9457 (`application/problem+json`): `400` file sai định d
 | Đường dẫn | Dùng cho |
 |---|---|
 | `/actuator/health/liveness` | Liveness probe. Luôn UP khi tiến trình còn sống, không phụ thuộc tải |
-| `/actuator/health/readiness` | Readiness probe. `503` khi đã đầy slot, để load balancer chuyển người dùng mới sang node khác |
+| `/actuator/health/readiness` | Readiness probe. `503` (trạng thái `BUSY`) khi đã đầy slot, để load balancer chuyển người dùng mới sang node khác |
+| `/actuator/health` | Tổng hợp. Node đầy slot vẫn trả `200`, vì đầy là bận chứ không phải hỏng |
 | `/actuator/metrics`, `/actuator/prometheus` | Metrics (Prometheus scrape được) |
 
 Metrics riêng: `stt.sessions.active`, `stt.sessions.max`, `stt.sessions.rejected`, `stt.inference.workers`, `stt.inference.active`, `stt.inference.queued`, `stt.inference.duration`, `stt.queue.wait`. Chỉ số cần theo dõi nhất là `stt.queue.wait`: tăng nghĩa là máy đang quá tải.
@@ -68,7 +69,7 @@ Metrics riêng: `stt.sessions.active`, `stt.sessions.max`, `stt.sessions.rejecte
 Client gửi:
 
 - **Binary frame**: PCM 16-bit little-endian, mono, số byte chẵn. Nên gửi mỗi 100 ms (3200 byte ở 16 kHz). Tối đa `maxFrameBytes` (mặc định 65536) mỗi frame, lớn hơn bị đóng với mã 1009.
-- **Text frame** `{"type":"end"}`: kết thúc câu hiện tại, server trả `final`.
+- **Text frame** `{"type":"end"}`: kết thúc câu hiện tại, server trả `final`. Nhiều `end` liên tiếp mà không có âm thanh xen giữa chỉ nhận một `final`.
 
 Server trả (JSON text):
 

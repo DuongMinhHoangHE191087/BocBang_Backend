@@ -173,6 +173,88 @@ class SessionPipelineTest {
     }
 
     @Test
+    void answersABurstOfEndCommandsWithOneFinalTranscript() throws Exception {
+        CountDownLatch release = blockWorkers(1);
+        SessionPipeline pipeline = new SessionPipeline(session, executor, listener, MAX_BUFFERED, MAX_BATCH);
+
+        for (int i = 0; i < 50; i++) {
+            pipeline.finish();
+        }
+        release.countDown();
+
+        await().atMost(5, TimeUnit.SECONDS).until(() -> !listener.events.isEmpty());
+        Thread.sleep(100);
+        assertThat(listener.events).containsExactly(TranscriptEvent.finalResult("done"));
+    }
+
+    @Test
+    void keepsAnEndCommandThatFollowsNewAudio() {
+        CountDownLatch release = blockWorkers(1);
+        SessionPipeline pipeline = new SessionPipeline(session, executor, listener, MAX_BUFFERED, MAX_BATCH);
+
+        pipeline.finish();
+        pipeline.offer(new byte[10]);
+        pipeline.finish();
+        release.countDown();
+
+        await().atMost(5, TimeUnit.SECONDS).until(() -> listener.events.size() == 3);
+        assertThat(listener.events).extracting(TranscriptEvent::type).containsExactly(
+                TranscriptEvent.Type.FINAL, TranscriptEvent.Type.PARTIAL, TranscriptEvent.Type.FINAL);
+    }
+
+    @Test
+    void answersAnEndCommandAgainOnceTheEarlierOneHasBeenAnswered() {
+        SessionPipeline pipeline = new SessionPipeline(session, executor, listener, MAX_BUFFERED, MAX_BATCH);
+
+        pipeline.finish();
+        await().atMost(5, TimeUnit.SECONDS).until(() -> listener.events.size() == 1);
+        pipeline.finish();
+
+        await().atMost(5, TimeUnit.SECONDS).until(() -> listener.events.size() == 2);
+    }
+
+    @Test
+    void reportsAnErrorThrownByTheEngineAsAFailureInsteadOfGoingSilent() {
+        session.error = new UnsatisfiedLinkError("native library vanished");
+        SessionPipeline pipeline = new SessionPipeline(session, executor, listener, MAX_BUFFERED, MAX_BATCH);
+
+        pipeline.offer(new byte[10]);
+
+        await().atMost(5, TimeUnit.SECONDS).until(() -> listener.failures.size() == 1);
+        assertThat(listener.failures.get(0)).isSameAs(session.error);
+        pipeline.close();
+        await().atMost(5, TimeUnit.SECONDS).until(() -> session.closeCount.get() == 1);
+    }
+
+    @Test
+    void tellsTheListenerOnceAfterTheSessionHasBeenClosed() throws Exception {
+        List<Integer> closeCountSeen = Collections.synchronizedList(new ArrayList<>());
+        listener.onClosedHook = () -> closeCountSeen.add(session.closeCount.get());
+        SessionPipeline pipeline = new SessionPipeline(session, executor, listener, MAX_BUFFERED, MAX_BATCH);
+
+        pipeline.offer(new byte[10]);
+        pipeline.close();
+        pipeline.close();
+
+        await().atMost(5, TimeUnit.SECONDS).until(() -> listener.closed.get() >= 1);
+        Thread.sleep(100);
+        assertThat(listener.closed.get()).isEqualTo(1);
+        assertThat(closeCountSeen).as("the session was already closed when the listener heard").containsExactly(1);
+    }
+
+    @Test
+    void closesTheSessionAndTellsTheListenerWhenTheExecutorHasAlreadyShutDown() {
+        executor.close();
+        SessionPipeline pipeline = new SessionPipeline(session, executor, listener, MAX_BUFFERED, MAX_BATCH);
+
+        pipeline.offer(new byte[10]);
+
+        assertThat(session.closeCount.get()).isEqualTo(1);
+        assertThat(listener.closed.get()).isEqualTo(1);
+        assertThat(listener.failures).hasSize(1);
+    }
+
+    @Test
     void alternatesBetweenSessionsSoNoneStarvesTheOthers() {
         List<String> order = Collections.synchronizedList(new ArrayList<>());
         RecordingSession first = new RecordingSession();

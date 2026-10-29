@@ -9,7 +9,9 @@ import java.io.InputStream;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.Optional;
 import java.util.concurrent.Callable;
+import java.util.concurrent.locks.ReentrantLock;
 import java.util.stream.Collectors;
 import javax.sound.sampled.AudioFormat;
 import javax.sound.sampled.AudioInputStream;
@@ -54,6 +56,10 @@ public class TranscriptionService {
                 throw new IllegalArgumentException("Only 16-bit little-endian PCM mono WAV is supported");
             }
             sampleRate = Math.round(format.getSampleRate());
+            if (!SampleRates.isSupported(sampleRate)) {
+                throw new IllegalArgumentException("WAV sample rate must be between " + SampleRates.MIN + " and "
+                        + SampleRates.MAX + " Hz, got " + sampleRate);
+            }
             pcm = audio.readAllBytes();
         } catch (UnsupportedAudioFileException e) {
             throw new IllegalArgumentException("File is not a valid WAV audio", e);
@@ -70,7 +76,7 @@ public class TranscriptionService {
         // 250 ms of audio per engine call, kept sample-aligned.
         int chunkBytes = sampleRate * BYTES_PER_SAMPLE / 4 & ~1;
         List<String> utterances = new ArrayList<>();
-        try (SpeechSession session = engine.openSession(sampleRate)) {
+        try (GuardedSession session = new GuardedSession(engine.openSession(sampleRate))) {
             for (int offset = 0; offset < pcm.length; offset += chunkBytes) {
                 int length = Math.min(chunkBytes, pcm.length - offset);
                 byte[] chunk = Arrays.copyOfRange(pcm, offset, offset + length);
@@ -99,5 +105,55 @@ public class TranscriptionService {
     }
 
     public record Transcription(String text, int sampleRate, long durationMillis) {
+    }
+
+    /**
+     * A request thread that is interrupted stops waiting for its queued call, but that call may already be inside
+     * the engine. Closing waits for it, and a call that starts after the close does nothing, so the session is
+     * never freed under a running decode.
+     */
+    private static final class GuardedSession implements AutoCloseable {
+
+        private final SpeechSession session;
+        private final ReentrantLock lock = new ReentrantLock();
+        private boolean closed;
+
+        GuardedSession(SpeechSession session) {
+            this.session = session;
+        }
+
+        Optional<TranscriptEvent> accept(byte[] pcm, int length) {
+            lock.lock();
+            try {
+                return closed ? Optional.empty() : session.accept(pcm, length);
+            } finally {
+                lock.unlock();
+            }
+        }
+
+        TranscriptEvent finish() {
+            lock.lock();
+            try {
+                if (closed) {
+                    throw new IllegalStateException("Session is closed");
+                }
+                return session.finish();
+            } finally {
+                lock.unlock();
+            }
+        }
+
+        @Override
+        public void close() {
+            lock.lock();
+            try {
+                if (!closed) {
+                    closed = true;
+                    session.close();
+                }
+            } finally {
+                lock.unlock();
+            }
+        }
     }
 }
