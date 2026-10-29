@@ -1,5 +1,7 @@
 package com.bocbang.backend.api;
 
+import com.bocbang.backend.runtime.InferenceExecutor;
+import com.bocbang.backend.runtime.SessionLimiter;
 import com.bocbang.backend.stt.SpeechToTextEngine;
 import com.bocbang.backend.stt.SttProperties;
 import com.bocbang.backend.stt.TranscriptionJob;
@@ -9,6 +11,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.net.URI;
 import java.util.List;
+import org.springframework.http.CacheControl;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.DeleteMapping;
@@ -20,29 +23,42 @@ import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.multipart.MultipartFile;
 
+/** Served under {@code /api/v1/stt}; the unversioned {@code /api/stt} is kept for clients built before v1. */
 @RestController
-@RequestMapping("/api/stt")
+@RequestMapping(path = {SttController.BASE_PATH, SttController.LEGACY_BASE_PATH},
+        produces = MediaType.APPLICATION_JSON_VALUE)
 public class SttController {
+
+    static final String BASE_PATH = "/api/v1/stt";
+    static final String LEGACY_BASE_PATH = "/api/stt";
 
     private final SpeechToTextEngine engine;
     private final SttProperties properties;
+    private final SessionLimiter limiter;
+    private final InferenceExecutor executor;
     private final TranscriptionService transcriptionService;
     private final TranscriptionJobService jobService;
 
     public SttController(
             SpeechToTextEngine engine,
             SttProperties properties,
+            SessionLimiter limiter,
+            InferenceExecutor executor,
             TranscriptionService transcriptionService,
             TranscriptionJobService jobService) {
         this.engine = engine;
         this.properties = properties;
+        this.limiter = limiter;
+        this.executor = executor;
         this.transcriptionService = transcriptionService;
         this.jobService = jobService;
     }
 
+    /** Engine, models, WebSocket location and live load, so a client can check there is room before it connects. */
     @GetMapping("/status")
-    public SttStatusResponse status() {
-        return new SttStatusResponse(
+    public ResponseEntity<SttStatusResponse> status() {
+        Capacity capacity = new Capacity(executor.workers(), limiter.max(), limiter.active(), executor.queued());
+        SttStatusResponse body = new SttStatusResponse(
                 engine.name(),
                 engine.defaultModel(),
                 engine.models(),
@@ -50,7 +66,10 @@ public class SttController {
                 properties.sampleRate(),
                 properties.maxUtteranceSeconds(),
                 "/ws/stt",
-                "/api/stt/jobs");
+                BASE_PATH + "/jobs",
+                capacity,
+                !limiter.isFull());
+        return ResponseEntity.ok().cacheControl(CacheControl.noStore()).body(body);
     }
 
     /** Synchronous transcription for short 16-bit mono WAV clips at the model's sample rate. */
@@ -61,13 +80,13 @@ public class SttController {
         }
         try (InputStream in = file.getInputStream()) {
             TranscriptionService.Transcription result = transcriptionService.transcribeWav(in);
-            return new TranscriptionResponse(result.text(), result.sampleRate());
+            return new TranscriptionResponse(result.text(), result.sampleRate(), result.durationMillis());
         }
     }
 
     /**
      * Queues a long audio file (WAV, MP3, M4A, OGG, FLAC...) for background transcription and returns
-     * immediately. Poll {@code GET /api/stt/jobs/{jobId}} for progress and the finished transcript.
+     * immediately. Poll {@code GET jobs/{jobId}} for progress and the finished transcript.
      */
     @PostMapping(path = "/jobs", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
     public ResponseEntity<TranscriptionJob> submitJob(
@@ -80,7 +99,7 @@ public class SttController {
         try (InputStream in = file.getInputStream()) {
             TranscriptionJob job = jobService.submit(in, file.getOriginalFilename(), model, refine);
             return ResponseEntity.accepted()
-                    .location(URI.create("/api/stt/jobs/" + job.jobId()))
+                    .location(URI.create(BASE_PATH + "/jobs/" + job.jobId()))
                     .body(job);
         }
     }
@@ -105,9 +124,14 @@ public class SttController {
             int sampleRate,
             int maxUtteranceSeconds,
             String websocketPath,
-            String jobsPath) {
+            String jobsPath,
+            Capacity capacity,
+            boolean ready) {
     }
 
-    public record TranscriptionResponse(String text, int sampleRate) {
+    public record Capacity(int workers, int maxSessions, int activeSessions, int queuedTasks) {
+    }
+
+    public record TranscriptionResponse(String text, int sampleRate, long durationMs) {
     }
 }

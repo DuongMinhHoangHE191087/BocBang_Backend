@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>BocBang - nhận dạng giọng nói trực tiếp</title>
+  <meta name="description" content="Trang thử máy chủ BocBang: nói vào micro hoặc phát file âm thanh, chữ hiện ngay theo thời gian thực.">
+  <link rel="stylesheet" href="app.css">
+</head>
+<body>
+  <header class="top">
+    <div>
+      <h1>BocBang</h1>
+      <p class="tagline">Nói vào micro, chữ hiện ra ngay khi bạn nói.</p>
+    </div>
+    <div class="server" id="server" role="status" aria-live="polite">
+      <span class="server-engine" id="serverEngine">Đang kiểm tra máy chủ</span>
+      <span class="meter" aria-hidden="true"><span class="meter-fill" id="meterFill"></span></span>
+      <span class="server-load" id="serverLoad"></span>
+    </div>
+  </header>
+
+  <main>
+    <div class="left">
+      <section class="stage" aria-label="Phụ đề trực tiếp">
+        <canvas id="ribbon" class="ribbon" height="96" aria-hidden="true"></canvas>
+        <div class="transcript" id="transcript">
+          <div id="finals" aria-live="polite"></div>
+          <p class="partial" id="partial" aria-live="off"></p>
+          <p class="hint" id="hint">Chọn nguồn âm thanh rồi nhấn Bắt đầu.</p>
+        </div>
+      </section>
+      <section class="clients" id="clients" aria-label="Các kết nối song song" hidden></section>
+    </div>
+
+    <aside class="rail" aria-label="Điều khiển">
+      <fieldset class="block">
+        <legend>Nguồn âm thanh</legend>
+        <label class="choice"><input type="radio" name="source" value="mic" checked> Micro</label>
+        <label class="choice"><input type="radio" name="source" value="file"> File âm thanh</label>
+        <p class="note" id="micNote" hidden></p>
+
+        <div class="file-options" id="fileOptions" hidden>
+          <label class="field">
+            <span>Chọn file (wav, mp3, ogg, m4a)</span>
+            <input type="file" id="file" accept="audio/*">
+          </label>
+          <label class="field">
+            <span>Số kết nối chạy song song</span>
+            <input type="number" id="count" min="1" max="64" value="1" inputmode="numeric">
+          </label>
+          <p class="note">Mỗi kết nối phát lại cùng file ở tốc độ thật, dùng để thử tải nhiều người dùng.</p>
+        </div>
+      </fieldset>
+
+      <div class="block">
+        <label class="field">
+          <span>Khóa API (chỉ cần khi máy chủ bật xác thực)</span>
+          <input type="password" id="apiKey" autocomplete="off" spellcheck="false">
+        </label>
+      </div>
+
+      <div class="block">
+        <button type="button" class="primary" id="toggle">Bắt đầu</button>
+        <p class="status" id="status" role="status" aria-live="polite">Sẵn sàng.</p>
+      </div>
+
+      <dl class="block stats">
+        <div><dt>Độ trễ máy chủ</dt><dd id="statLag">-</dd></div>
+        <div><dt>Độ trễ cao nhất</dt><dd id="statLagMax">-</dd></div>
+        <div><dt>Khung đã gửi</dt><dd id="statFrames">0</dd></div>
+        <div><dt>Kết nối đang mở</dt><dd id="statOpen">0</dd></div>
+      </dl>
+
+      <div class="block">
+        <h2>Gửi cả file qua REST</h2>
+        <p class="note">Gửi cả file đã chọn lên <code>POST /api/v1/stt/transcriptions</code>.</p>
+        <button type="button" class="secondary" id="rest">Chuyển file thành văn bản</button>
+        <p class="rest-result" id="restResult" role="status" aria-live="polite"></p>
+      </div>
+    </aside>
+  </main>
+
+  <script src="app.js"></script>
+</body>
+</html>

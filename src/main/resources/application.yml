@@ -7,11 +7,65 @@ spring:
       max-file-size: 500MB
       max-request-size: 500MB
       file-size-threshold: 1MB
+  lifecycle:
+    timeout-per-shutdown-phase: 20s
 
 server:
   port: 8080
+  shutdown: graceful
+  tomcat:
+    # WebSocket connections idle on the NIO poller, not on a thread each; inference runs on its own pool (stt.pool).
+    threads:
+      max: 200
+    max-connections: 8192
+    accept-count: 100
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,prometheus
+  endpoint:
+    health:
+      probes:
+        enabled: true
+      show-details: always
+      status:
+        # BUSY (every stream slot taken) ranks below UP here, so /actuator/health stays 200 on a busy node.
+        order: DOWN,OUT_OF_SERVICE,UP,BUSY,UNKNOWN
+      group:
+        # Readiness ranks BUSY above UP and answers 503 for it, so load balancers stop sending new streams;
+        # liveness never depends on load.
+        readiness:
+          include: readinessState,stt
+          status:
+            order: DOWN,OUT_OF_SERVICE,BUSY,UP,UNKNOWN
+            http-mapping:
+              BUSY: 503
 
 stt:
+  # jni (default, native models below) or mock (scripted words, no model files). A new engine registers itself
+  # for its own name, see README.
+  engine: ${STT_ENGINE:jni}
+  # How realtime streams share the machine (RuntimeProperties). The JNI engine only returns text after an end
+  # command, so a client keeps streaming the next utterance while the previous one is still being transcribed:
+  # allow that much audio to wait before the server calls the client too slow.
+  session:
+    max-buffered-audio: ${STT_MAX_BUFFERED_AUDIO:30s}
+  # API keys accepted on /api/** and /ws/**, comma-separated. Empty (default) turns authentication off.
+  # Actuator probes and the demo page never need a key.
+  security:
+    api-keys: ${STT_API_KEYS:}
+  # pool:
+  #   workers: 0        # inference threads; 0 = CPU count - 1
+  #   max-sessions: 0   # concurrent streams; 0 = workers x the engine's streams per worker (jni 1, mock 4). Measure with real speech, then set it.
+  # session:
+  #   max-batch-audio: 500ms
+  # websocket:
+  #   allowed-origins: https://app.example.com
+  #   max-frame-bytes: 65536
+  #   idle-timeout: 60s
+
   # Model baseline: 16 kHz mono PCM. Realtime endpoints reject other rates; long-audio jobs convert via ffmpeg.
   sample-rate: 16000
   max-utterance-seconds: 60

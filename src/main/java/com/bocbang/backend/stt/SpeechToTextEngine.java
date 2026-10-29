@@ -11,12 +11,25 @@ public interface SpeechToTextEngine {
 
     String name();
 
+    /**
+     * How many realtime streams one inference thread can keep up with. The default stream limit is the worker
+     * count times this. Keep 1 for a model whose speed you have not measured; raise it only with numbers from
+     * {@code tools/load-test.mjs} using real speech, because silence is about ten times cheaper to decode.
+     */
+    default int sessionsPerWorker() {
+        return 1;
+    }
+
     /** Model used by realtime sessions and by jobs that do not choose one. */
     String defaultModel();
 
     List<String> models();
 
-    /** Opens a realtime session on the default model for 16-bit little-endian mono PCM. */
+    /**
+     * Opens a realtime session on the default model for 16-bit little-endian mono PCM.
+     *
+     * @throws IllegalArgumentException if the engine does not accept this sample rate
+     */
     SpeechSession openSession(int sampleRate);
 
     /**

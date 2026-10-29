@@ -12,6 +12,7 @@ import java.util.List;
 import java.util.Map;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.stereotype.Component;
 
 /**
@@ -20,6 +21,7 @@ import org.springframework.stereotype.Component;
  * in native RAM at a time, reusing it across all speech segments of a job.
  */
 @Component
+@ConditionalOnProperty(prefix = "stt", name = "engine", havingValue = "jni", matchIfMissing = true)
 public class JniSpeechEngine implements SpeechToTextEngine, AutoCloseable {
 
     private static final Logger log = LoggerFactory.getLogger(JniSpeechEngine.class);
