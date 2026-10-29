@@ -56,6 +56,8 @@ stt:
   # Actuator probes and the demo page never need a key.
   security:
     api-keys: ${STT_API_KEYS:}
+    # true also requires the key on /actuator/metrics, /prometheus and /info; the health probes stay open.
+    protect-actuator: ${STT_PROTECT_ACTUATOR:false}
   # pool:
   #   workers: 0        # inference threads; 0 = CPU count - 1
   #   max-sessions: 0   # concurrent streams; 0 = workers x the engine's streams per worker (jni 1, mock 4). Measure with real speech, then set it.

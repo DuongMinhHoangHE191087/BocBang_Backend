@@ -114,6 +114,35 @@ class ApiKeyFilterTest {
     }
 
     @Test
+    void leavesMetricsOpenUnlessActuatorProtectionIsSwitchedOn() throws Exception {
+        ApiKeyFilter filter = filter("secret");
+
+        assertThat(call(filter, request("/actuator/prometheus")).passed()).isTrue();
+        assertThat(call(filter, request("/actuator/metrics/stt.sessions.active")).passed()).isTrue();
+    }
+
+    @Test
+    void protectsMetricsButNeverTheHealthProbesWhenActuatorProtectionIsOn() throws Exception {
+        ApiKeyFilter filter = filterProtectingActuator("secret");
+        MockHttpServletRequest withKey = request("/actuator/prometheus");
+        withKey.addHeader("Authorization", "Bearer secret");
+
+        assertThat(call(filter, request("/actuator/prometheus")).response().getStatus()).isEqualTo(401);
+        assertThat(call(filter, request("/actuator/metrics/stt.sessions.active")).response().getStatus()).isEqualTo(401);
+        assertThat(call(filter, request("/actuator/info")).response().getStatus()).isEqualTo(401);
+        assertThat(call(filter, withKey).passed()).isTrue();
+        assertThat(call(filter, request("/actuator/health")).passed()).isTrue();
+        assertThat(call(filter, request("/actuator/health/liveness")).passed()).isTrue();
+        assertThat(call(filter, request("/actuator/health/readiness")).passed()).isTrue();
+    }
+
+    @Test
+    void doesNotLetAPathThatMerelyStartsWithHealthSkipTheKey() throws Exception {
+        assertThat(call(filterProtectingActuator("secret"), request("/actuator/healthy")).response().getStatus())
+                .isEqualTo(401);
+    }
+
+    @Test
     void judgesThePathTheContainerRoutesOnNotThePathParametersInTheUri() throws Exception {
         MockHttpServletRequest sneaky = request("/api/v1/stt/status");
         sneaky.setRequestURI("/api;x=1/v1/stt/status");
@@ -122,7 +151,11 @@ class ApiKeyFilterTest {
     }
 
     private ApiKeyFilter filter(String... keys) {
-        return new ApiKeyFilter(new SecurityProperties(List.of(keys)), meters);
+        return new ApiKeyFilter(new SecurityProperties(List.of(keys), false), meters);
+    }
+
+    private ApiKeyFilter filterProtectingActuator(String... keys) {
+        return new ApiKeyFilter(new SecurityProperties(List.of(keys), true), meters);
     }
 
     /** The container resolves the servlet path before filters run, so tests set it the same way. */
