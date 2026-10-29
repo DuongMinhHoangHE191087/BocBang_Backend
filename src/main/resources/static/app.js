@@ -5,7 +5,14 @@
   const FRAME_SAMPLES = 1600; // 100 ms
   const FRAME_MS = 100;
   const STATUS_POLL_MS = 1500;
-  const FINAL_WAIT_MS = 1200;
+  // Engines that answer only after an end command (the native one) need the end sent when the speaker pauses,
+  // and a long wait for the last answer after Stop.
+  const FINAL_TIMEOUT_MS = 30000;
+  const SPEECH_RMS = 0.015; // frame loudness that counts as speech
+  const PAUSE_FRAMES = 8; // 0.8 s of quiet closes an utterance
+  const MIN_SPEECH_FRAMES = 3;
+  const PREROLL_FRAMES = 3; // 0.3 s kept from before the first loud frame, so the start of a word is not clipped
+  const MAX_UTTERANCE_FRAMES = 250; // 25 s of audio sent since the last end, well inside the server's 60 s limit
 
   const $ = (id) => document.getElementById(id);
   const el = {
@@ -44,6 +51,9 @@
       this.handlers = handlers;
       this.ws = null;
       this.ready = false;
+      this.audioSinceEnd = false;
+      /** Ends sent and not yet answered by a final (or by a recognition_failed in its place). */
+      this.pendingEnds = 0;
     }
 
     open() {
@@ -58,6 +68,11 @@
         const fail = (error) => { if (!settled) { settled = true; reject(error); } };
         ws.onmessage = (event) => {
           const message = JSON.parse(event.data);
+          // Every end is answered by a final or by recognition_failed. A streaming engine can also send finals nobody
+          // asked for; those cannot be told apart here, so the count never goes below zero.
+          if (message.type === 'final' || message.code === 'recognition_failed') {
+            this.pendingEnds = Math.max(0, this.pendingEnds - 1);
+          }
           if (message.type === 'ready') {
             this.ready = true;
             settled = true;
@@ -81,12 +96,15 @@
     sendPcm(pcm) {
       if (this.ready && this.ws.readyState === WebSocket.OPEN) {
         this.ws.send(pcm);
+        this.audioSinceEnd = true;
       }
     }
 
     end() {
-      if (this.ready && this.ws.readyState === WebSocket.OPEN) {
+      if (this.ready && this.audioSinceEnd && this.ws.readyState === WebSocket.OPEN) {
         this.ws.send(JSON.stringify({ type: 'end' }));
+        this.audioSinceEnd = false;
+        this.pendingEnds++;
       }
     }
 
@@ -356,6 +374,13 @@
         renderStats();
       },
       onError(message) {
+        if (message.code === 'recognition_failed' || message.code === 'invalid_audio') {
+          setTile(id, 'live', 'Bỏ qua một câu', message.message);
+          if (id === 0) {
+            setStatus(`Bỏ qua một câu: ${message.message}`, true);
+          }
+          return;
+        }
         setTile(id, message.code === 'capacity_exceeded' ? 'refused' : 'failed', 'Bị từ chối', message.message);
       },
       onClose(event, reason) {
@@ -378,13 +403,54 @@
     tiles.clear();
     ribbon.reset();
     Object.assign(run, { frames: 0, recentLags: [], lagMax: 0, connections: [] });
+    resetUtterance();
     renderStats();
   }
 
-  function onFrame(frame, rms) {
-    run.frames++;
-    ribbon.push(rms);
+  /**
+   * Audio goes to the server only while someone is speaking. Quiet before the first word is not sent: a minute of
+   * silence would otherwise fill the server's utterance limit before the speaker says anything. An utterance is
+   * closed with end when the speaker pauses, or when 25 s of audio has been sent since the last end.
+   */
+  const utterance = { speaking: false, loud: 0, quiet: 0, sent: 0, preroll: [] };
+  const resetUtterance = () => Object.assign(utterance, { speaking: false, loud: 0, quiet: 0, sent: 0, preroll: [] });
+
+  function sendToAll(frame) {
     run.connections.forEach((connection) => connection.sendPcm(frame));
+    run.frames++;
+    utterance.sent++;
+  }
+
+  function onFrame(frame, rms) {
+    ribbon.push(rms);
+    const loud = rms >= SPEECH_RMS;
+    if (!utterance.speaking) {
+      if (!loud) {
+        utterance.preroll.push(frame);
+        if (utterance.preroll.length > PREROLL_FRAMES) {
+          utterance.preroll.shift();
+        }
+        return;
+      }
+      utterance.speaking = true;
+      utterance.preroll.forEach(sendToAll);
+      utterance.preroll = [];
+    }
+    sendToAll(frame);
+    if (loud) {
+      utterance.loud++;
+      utterance.quiet = 0;
+    } else {
+      utterance.quiet++;
+    }
+    const paused = utterance.quiet >= PAUSE_FRAMES;
+    if ((paused && utterance.loud >= MIN_SPEECH_FRAMES) || utterance.sent >= MAX_UTTERANCE_FRAMES) {
+      run.connections.forEach((connection) => connection.end());
+      resetUtterance();
+    } else if (paused) {
+      // A burst too short to be speech: stop streaming, but keep the sent count so the server-side total stays bounded.
+      Object.assign(utterance, { speaking: false, loud: 0, quiet: 0, preroll: [] });
+    }
     if (run.frames % 5 === 0) {
       renderStats();
     }
@@ -452,14 +518,22 @@
     const { source, connections } = run;
     source.stop();
     el.toggle.disabled = true;
-    setStatus('Đang chốt câu cuối...');
+    setStatus('Đang nhận dạng câu cuối...');
     connections.forEach((connection) => connection.end());
-    await sleep(FINAL_WAIT_MS);
+    const deadline = performance.now() + FINAL_TIMEOUT_MS;
+    while (performance.now() < deadline && connections.some((c) => c.ready && c.pendingEnds > 0)) {
+      await sleep(100);
+    }
+    const unanswered = connections.some((c) => c.ready && c.pendingEnds > 0);
     connections.forEach((connection) => connection.close());
     el.toggle.textContent = 'Bắt đầu';
     el.toggle.classList.remove('running');
     el.toggle.disabled = false;
-    setStatus(message || 'Đã dừng.', isError);
+    if (unanswered) {
+      setStatus('Đã dừng, nhưng máy chủ chưa trả kịp kết quả câu cuối.', true);
+    } else {
+      setStatus(message || 'Đã dừng.', isError);
+    }
     renderStats();
   }
 

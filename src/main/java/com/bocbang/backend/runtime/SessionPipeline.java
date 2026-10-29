@@ -40,6 +40,9 @@ public final class SessionPipeline {
         }
     }
 
+    /** Rejections in a row after which the engine is taken to be broken rather than the input bad. */
+    static final int MAX_CONSECUTIVE_REJECTIONS = 50;
+
     private interface Task {
     }
 
@@ -67,6 +70,8 @@ public final class SessionPipeline {
     private final AtomicBoolean tailIsFinish = new AtomicBoolean();
     private volatile boolean failed;
     private boolean sessionClosed;
+    /** Rejections since the engine last accepted something. Only the holder of {@code running} touches it. */
+    private int consecutiveRejections;
 
     public SessionPipeline(SpeechSession session, InferenceExecutor executor, Listener listener,
             long maxBufferedBytes, int maxBatchBytes) {
@@ -181,8 +186,9 @@ public final class SessionPipeline {
         try {
             session.accept(pcm, pcm.length)
                     .ifPresent(event -> listener.onTranscript(event, millisSince(first.enqueuedNanos())));
+            consecutiveRejections = 0;
         } catch (IllegalArgumentException | SpeechRecognitionException e) {
-            notifyRejected(e);
+            reject(e);
         } catch (RuntimeException | Error e) {
             // A native engine fails with Errors (UnsatisfiedLinkError, OutOfMemoryError); the client must still hear it.
             fail(e);
@@ -196,10 +202,26 @@ public final class SessionPipeline {
         try {
             TranscriptEvent result = session.finish();
             listener.onTranscript(result, millisSince(finish.enqueuedNanos()));
-        } catch (IllegalArgumentException | SpeechRecognitionException e) {
-            notifyRejected(e);
+            consecutiveRejections = 0;
+        } catch (SpeechRecognitionException e) {
+            reject(e);
+        } catch (IllegalArgumentException e) {
+            // An end is answered by a final or by recognition_failed; a client counting its ends relies on that.
+            reject(new SpeechRecognitionException(e.getMessage(), e));
         } catch (RuntimeException | Error e) {
             fail(e);
+        }
+    }
+
+    /**
+     * Reports a refused input and keeps the session, unless the engine has refused so many in a row that it is
+     * the engine that is broken: then the session is failed and closed instead of holding its slot for nothing.
+     */
+    private void reject(RuntimeException cause) {
+        if (++consecutiveRejections >= MAX_CONSECUTIVE_REJECTIONS) {
+            fail(cause);
+        } else {
+            notifyRejected(cause);
         }
     }
 

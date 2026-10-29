@@ -130,33 +130,6 @@ public final class Wav {
         }
     }
 
-    /** Writes the audio between two timestamps of {@code source} as a standalone WAV file. */
-    public static void writeSlice(Path source, Info info, double startSeconds, double endSeconds, Path target)
-            throws IOException {
-        long frame = info.bytesPerFrame();
-        long from = clamp(Math.round(startSeconds * info.sampleRate()) * frame, 0, info.dataLength());
-        long to = clamp(Math.round(endSeconds * info.sampleRate()) * frame, from, info.dataLength());
-        copy(source, info.dataOffset() + from, to - from, target, header(to - from, info.sampleRate()));
-    }
-
-    private static void copy(Path source, long offset, long length, Path target, byte[] header) throws IOException {
-        try (FileChannel in = FileChannel.open(source, StandardOpenOption.READ);
-             FileChannel out = FileChannel.open(target, StandardOpenOption.CREATE,
-                     StandardOpenOption.TRUNCATE_EXISTING, StandardOpenOption.WRITE)) {
-            if (header != null) {
-                out.write(ByteBuffer.wrap(header));
-            }
-            long copied = 0;
-            while (copied < length) {
-                long n = in.transferTo(offset + copied, length - copied, out);
-                if (n <= 0) {
-                    throw new EOFException("Unexpected end of " + source.getFileName());
-                }
-                copied += n;
-            }
-        }
-    }
-
     private static ByteBuffer readFully(FileChannel channel, long position, int length) throws IOException {
         ByteBuffer buffer = ByteBuffer.allocate(length).order(ByteOrder.LITTLE_ENDIAN);
         while (buffer.hasRemaining()) {

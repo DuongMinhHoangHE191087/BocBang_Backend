@@ -183,8 +183,9 @@ public class SpeechWebSocketHandler extends AbstractWebSocketHandler implements 
             @Override
             public void onRejected(RuntimeException cause) {
                 if (cause instanceof SpeechRecognitionException) {
+                    // The log keeps the cause; the client gets no model paths or native messages.
                     LOG.warn("Recognition failed on session {}: {}", socket.getId(), cause.getMessage());
-                    sendError(socket, "recognition_failed", cause.getMessage());
+                    sendError(socket, "recognition_failed", "Recognition failed for this utterance");
                 } else {
                     sendError(socket, "invalid_audio", cause.getMessage() + ", send {\"type\":\"end\"} more often");
                 }

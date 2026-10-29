@@ -81,7 +81,7 @@ Mở `http://localhost:8080/`.
 - **Gửi cả file qua REST**: thử `POST /api/v1/stt/transcriptions` với cùng file.
 - Góc trên phải hiện engine và mức tải hiện tại của máy chủ.
 
-Engine `jni` chỉ trả văn bản sau khi nhận `end`, nên khung "đang nói" chỉ hiện chữ khi bạn dừng; engine `mock` có chữ chạy liên tục.
+Demo chỉ gửi âm thanh khi có người nói (kèm 0,3 giây đệm phía trước để không cắt đầu từ), nên im lặng kéo dài không làm đầy giới hạn 60 giây của máy chủ. Engine `jni` chỉ trả văn bản sau khi nhận `end`, nên demo tự gửi `end` khi bạn ngừng nói khoảng 0,8 giây (và sau 25 giây nếu nói liền), rồi chữ của câu đó hiện ra. Bấm Dừng thì demo chờ tối đa 30 giây cho câu cuối; quá hạn nó báo chưa nhận được thay vì im lặng đóng kết nối. Engine `mock` có chữ chạy liên tục.
 
 ## API
 
@@ -93,9 +93,9 @@ Engine `jni` chỉ trả văn bản sau khi nhận `end`, nên khung "đang nói
 | POST | `/api/v1/stt/jobs` | Tạo job cho file âm thanh dài (`?model=qwen3-asr\|whisper-en&refine=true`), trả `202` |
 | GET | `/api/v1/stt/jobs/{jobId}` | Xem tiến độ (`0.0..1.0`), các đoạn đã xong và văn bản cuối cùng |
 | DELETE | `/api/v1/stt/jobs/{jobId}` | Hủy job đang chạy (bật cờ abort trong C++) và xóa file tạm |
-| POST | `/api/v1/stt/transcriptions` | Nhận dạng đồng bộ một file WAV 16 kHz 16-bit mono ngắn, trả `{"text","sampleRate","durationMs"}` |
+| POST | `/api/v1/stt/transcriptions` | Nhận dạng đồng bộ một file WAV 16 kHz 16-bit mono dài tối đa `stt.max-utterance-seconds` (60 giây), trả `{"text","sampleRate","durationMs"}`. Dài hơn thì dùng `/jobs` |
 
-Đường dẫn cũ `/api/stt/...` vẫn dùng được như bí danh cho client viết trước khi có `/api/v1`; client mới nên dùng `/api/v1`. `/api/health` không còn: dùng `/actuator/health`.
+Đường dẫn cũ `/api/stt/...` vẫn dùng được như bí danh cho client viết trước khi có `/api/v1`, nhưng đã deprecated: phản hồi kèm `Deprecation` và `Link: <đường dẫn /api/v1 tương ứng>; rel="successor-version"`. Chưa có ngày gỡ bỏ. Client mới nên dùng `/api/v1`. `/api/health` không còn: dùng `/actuator/health`.
 
 ```bash
 curl -F "file=@meeting.m4a" "http://localhost:8080/api/v1/stt/jobs?model=qwen3-asr&refine=true"
@@ -103,7 +103,9 @@ curl http://localhost:8080/api/v1/stt/jobs/<jobId>
 curl -F "file=@sample.wav" http://localhost:8080/api/v1/stt/transcriptions
 ```
 
-Lỗi trả theo RFC 9457 (`application/problem+json`): `400` file sai định dạng hoặc sai sample rate, `413` file quá lớn, `415` không phải multipart, `503` khi model lỗi, hoặc kèm `Retry-After` khi mọi slot nhận dạng đang bận.
+Thông báo lỗi nội bộ (đường dẫn model, đầu ra ffmpeg, lỗi native) chỉ vào log máy chủ; client, kể cả trường `error` của job, chỉ nhận mô tả chung. Hàng đợi job đầy thì bị từ chối ngay (`503`) trước khi máy chủ nhận file, và thư mục tạm của job được dọn khi tắt máy chủ cũng như khi khởi động lại.
+
+Lỗi trả theo RFC 9457 (`application/problem+json`): `400` file sai định dạng, sai sample rate hoặc quá dài cho `/transcriptions`, `413` file quá lớn, `415` không phải multipart, `503` khi model lỗi, hoặc kèm `Retry-After` khi mọi slot nhận dạng đang bận.
 
 ### Vận hành (Actuator)
 
@@ -143,8 +145,8 @@ Server trả (JSON text):
 | `overloaded` | Client có hơn `max-buffered-audio` âm thanh chưa xử lý xong | Đóng, mã 1013 |
 | `invalid_frame` | Frame có số byte lẻ | Giữ kết nối, bỏ frame |
 | `invalid_command` | Text frame không hợp lệ | Giữ kết nối |
-| `invalid_audio` | Engine từ chối âm thanh, ví dụ câu dài quá giới hạn | Giữ kết nối. Gửi `end` thường xuyên hơn |
-| `recognition_failed` | Model không ra được văn bản cho câu này (hết thời gian, bị hủy) | Giữ kết nối, câu đó bị bỏ, câu sau chạy bình thường |
+| `invalid_audio` | Engine từ chối âm thanh, ví dụ câu dài quá giới hạn | Giữ kết nối. Gửi `end` thường xuyên hơn. Engine từ chối liên tiếp 50 lần mà không nhận được gì thì đóng với `engine_failure` |
+| `recognition_failed` | Model không ra được văn bản cho câu này (hết thời gian, bị hủy) | Giữ kết nối, câu đó bị bỏ, câu sau chạy bình thường. Mỗi `end` luôn nhận đúng một `final` hoặc một `recognition_failed`. Thông báo chỉ nêu chung, chi tiết ở log máy chủ. Liên tiếp 50 lần thì đóng với `engine_failure` |
 | `engine_failure` | Model hỏng nặng (lỗi native) | Đóng, mã 1011 |
 
 Kết nối không gửi gì trong `idle-timeout` (60 giây) bị đóng với mã 1001; Tomcat quét định kỳ nên có thể trễ vài giây. Client nhận kết quả quá chậm (hơn `send-timeout`) bị ngắt.
@@ -168,7 +170,7 @@ X-Api-Key: <khóa>
 
 Trình duyệt không đặt được header cho WebSocket, nên riêng `/ws/**` nhận thêm `?apiKey=<khóa>`. Khóa nằm trong URL có thể bị ghi lại ở proxy, nên client Android (đặt được header) hãy dùng header. Trang demo có ô "Khóa API" cho việc này.
 
-Thiếu hoặc sai khóa: REST trả `401` kèm `WWW-Authenticate: Bearer` và `application/problem+json`; WebSocket bị từ chối ngay ở bước bắt tay với `401`. Mỗi lần từ chối tăng metric `stt.auth.rejected`. `/actuator/**` và trang demo không cần khóa, vì probe không mang khóa. Khóa không mã hóa gì cả: ngoài mạng tin cậy, hãy đặt sau HTTPS.
+Thiếu hoặc sai khóa: REST trả `401` kèm `WWW-Authenticate: Bearer` và `application/problem+json`; WebSocket bị từ chối ngay ở bước bắt tay với `401`. Mỗi lần từ chối tăng metric `stt.auth.rejected`. Trang demo và các probe `/actuator/health/**` không cần khóa, vì probe không mang khóa. Metrics (`/actuator/metrics`, `/actuator/prometheus`) mặc định cũng mở; đặt `STT_PROTECT_ACTUATOR=true` để đòi khóa cho cả metrics (Prometheus gửi được `Authorization: Bearer` qua mục `authorization` của `scrape_config`). Khóa không mã hóa gì cả: ngoài mạng tin cậy, hãy đặt sau HTTPS.
 
 ## Đa luồng và sức chứa
 
@@ -198,6 +200,7 @@ Cấu hình trong `application.yml` (hoặc biến môi trường dạng `STT_PO
 | `stt.session.max-buffered-audio` | 30s | Âm thanh chờ tối đa của một client |
 | `stt.session.max-batch-audio` | 500ms | Âm thanh gộp tối đa mỗi lần gọi model |
 | `stt.security.api-keys` | rỗng (tắt) | Danh sách khóa API, biến môi trường `STT_API_KEYS`. Xem "Xác thực (API key)" |
+| `stt.security.protect-actuator` | `false` | `true` thì metrics và info cũng đòi khóa (probe health vẫn mở). Biến `STT_PROTECT_ACTUATOR`. Không có tác dụng khi chưa đặt khóa |
 | `stt.websocket.allowed-origins` | `*` | Origin được phép. Giới hạn lại trước khi public |
 | `stt.websocket.max-frame-bytes` | 65536 | Kích thước frame nhị phân tối đa |
 | `stt.websocket.idle-timeout` | 60s | Ngắt kết nối im lặng |
@@ -208,9 +211,10 @@ Cấu hình trong `application.yml` (hoặc biến môi trường dạng `STT_PO
 
 ```
 node tools/load-test.mjs localhost:8080 6 25 tiengnoi.wav
+node tools/load-test.mjs localhost:8080 6 40 tiengnoi.wav --end-every=8 --api-key=khoa-cua-ban
 ```
 
-Đối số: `host:port`, số kết nối, số giây, và file WAV 16 kHz mono 16-bit (tùy chọn). **Luôn đo bằng file tiếng nói thật.** Không có file thì tool phát im lặng, và im lặng giải mã nhanh hơn nhiều lần tiếng nói nên cho con số quá lạc quan.
+Đối số: `host:port`, số kết nối, số giây, và file WAV 16 kHz mono 16-bit (tùy chọn). `--end-every=<giây>` gửi `end` định kỳ: **bắt buộc với engine `jni`**, vì nó chỉ trả văn bản sau `end`; thiếu cờ này công cụ chỉ nhận một kết quả ở cuối và phân vị `lagMs` không có ý nghĩa (công cụ sẽ nhắc). `--api-key=<khóa>` dùng khi máy chủ bật xác thực. **Luôn đo bằng file tiếng nói thật.** Không có file thì tool phát im lặng, và im lặng giải mã nhanh hơn nhiều lần tiếng nói nên cho con số quá lạc quan.
 
 Tăng dần số kết nối đến khi p95 của `lagMs` vượt mức bạn chấp nhận được (ví dụ 2 giây), rồi đặt `stt.pool.max-sessions` thấp hơn mức đó một chút. Quá mức đó, server vẫn tự bảo vệ: client tụt quá `max-buffered-audio` bị ngắt, nhưng đặt đúng `max-sessions` thì người dùng thừa được từ chối ngay từ cửa (`capacity_exceeded`) thay vì bị ngắt giữa chừng. Khi đo, tắt hết tiến trình nền nặng, nếu không số đo sai nhiều lần. Chưa có số đo cho engine `jni` trên board G520; số đo cũ với Vosk không còn áp dụng.
 
@@ -232,6 +236,8 @@ Quy ước engine phải giữ:
 - Không sửa `websocket/` hay `api/` khi thêm engine.
 
 ## Kiến trúc
+
+Lý do của từng quyết định và những việc còn nợ: [docs/quyet-dinh-kien-truc.md](docs/quyet-dinh-kien-truc.md).
 
 ```
 com.bocbang.backend
@@ -261,5 +267,5 @@ Test chạy ngay không cần model: đơn vị cho runtime đa luồng, engine 
 - Spring Boot không chạy trực tiếp trong APK Android. Mô hình đúng là: app Android thu âm và gửi qua WebSocket tới server (board, PC, Raspberry Pi...).
 - `allowed-origins` đang là `*` để dev dễ. Trước khi public, đặt `stt.websocket.allowed-origins`.
 - Sau reverse proxy (nginx...), bật nâng cấp WebSocket (`Upgrade`/`Connection`) và đặt `proxy_read_timeout` lớn hơn `idle-timeout`. Trỏ readiness probe vào `/actuator/health/readiness`.
-- Khóa API (`STT_API_KEYS`) chỉ bảo vệ `/api` và `/ws`. `/actuator` (kể cả metrics) và trang demo luôn mở, nên đừng mở máy chủ ra Internet khi chưa đặt sau proxy có kiểm soát truy cập và HTTPS.
+- Khóa API (`STT_API_KEYS`) bảo vệ `/api` và `/ws`; metrics chỉ được bảo vệ khi bật `STT_PROTECT_ACTUATOR`. Trang demo và probe health luôn mở. Đừng mở máy chủ ra Internet khi chưa đặt sau proxy có kiểm soát truy cập và HTTPS.
 - RAM của board là giới hạn thật: model ASR ~1.3 GB, refiner ~2.5 GB, mỗi câu realtime giữ âm thanh trong heap tối đa `max-utterance-seconds`. Đặt `-Xmx` và `max-sessions` theo RAM thực tế.

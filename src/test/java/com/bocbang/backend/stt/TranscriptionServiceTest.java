@@ -91,6 +91,36 @@ class TranscriptionServiceTest {
     }
 
     @Test
+    @Timeout(10)
+    void refusesAudioLongerThanTheUtteranceLimitBeforeProcessingAnyOfIt() throws Exception {
+        FakeSpeechToTextEngine engine = new FakeSpeechToTextEngine("unused");
+        TranscriptionService service =
+                new TranscriptionService(engine, TestSettings.properties("max-utterance-seconds", "2"), limiter, executor);
+        byte[] threeSeconds = wav(16000, 16, new byte[16000 * 2 * 3]);
+
+        assertThatThrownBy(() -> service.transcribeWav(new ByteArrayInputStream(threeSeconds)))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("2 s limit")
+                .hasMessageContaining("/api/v1/stt/jobs");
+        assertThat(engine.openedSampleRates).isEmpty();
+        assertThat(limiter.active()).isZero();
+    }
+
+    @Test
+    @Timeout(10)
+    void acceptsAudioExactlyAtTheUtteranceLimit() throws Exception {
+        FakeSpeechToTextEngine engine = new FakeSpeechToTextEngine("đủ dài");
+        TranscriptionService service =
+                new TranscriptionService(engine, TestSettings.properties("max-utterance-seconds", "2"), limiter, executor);
+
+        TranscriptionService.Transcription result =
+                service.transcribeWav(new ByteArrayInputStream(wav(16000, 16, new byte[16000 * 2 * 2])));
+
+        assertThat(result.text()).isEqualTo("đủ dài");
+        assertThat(result.durationMillis()).isEqualTo(2000);
+    }
+
+    @Test
     @Timeout(15)
     void doesNotCloseTheSessionUnderAnInferenceThreadWhenTheRequestIsInterrupted() throws Exception {
         GatedEngine engine = new GatedEngine();

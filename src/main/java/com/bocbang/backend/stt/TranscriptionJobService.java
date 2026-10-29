@@ -16,14 +16,15 @@ import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
-import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
+import java.util.regex.Pattern;
 import java.util.stream.Collectors;
+import java.util.stream.Stream;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
@@ -38,6 +39,8 @@ import org.springframework.util.FileSystemUtils;
 public class TranscriptionJobService implements AutoCloseable {
 
     private static final Logger log = LoggerFactory.getLogger(TranscriptionJobService.class);
+    private static final Pattern JOB_DIRECTORY =
+            Pattern.compile("[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}");
 
     private final SttProperties properties;
     private final SpeechToTextEngine engine;
@@ -45,7 +48,8 @@ public class TranscriptionJobService implements AutoCloseable {
     private final TranscriptRefiner refiner;
     private final AudioConverter converter;
     private final Path jobsRoot;
-    private final ExecutorService executor;
+    private final ThreadPoolExecutor executor;
+    private final boolean ownsRoot;
     private final Map<String, JobState> jobs = new ConcurrentHashMap<>();
 
     public TranscriptionJobService(
@@ -60,9 +64,13 @@ public class TranscriptionJobService implements AutoCloseable {
         this.refiner = refiner;
         this.converter = converter;
         String configuredDir = properties.jobs().directory();
-        this.jobsRoot = configuredDir == null || configuredDir.isBlank()
+        this.ownsRoot = configuredDir == null || configuredDir.isBlank();
+        this.jobsRoot = ownsRoot
                 ? Files.createTempDirectory("bocbang-jobs-")
                 : Files.createDirectories(Path.of(configuredDir));
+        if (!ownsRoot) {
+            sweepStaleJobDirectories(jobsRoot);
+        }
         this.executor = new ThreadPoolExecutor(
                 1, 1, 0L, TimeUnit.MILLISECONDS,
                 new LinkedBlockingQueue<>(Math.max(1, properties.jobs().maxQueued())),
@@ -74,6 +82,10 @@ public class TranscriptionJobService implements AutoCloseable {
             throws IOException {
         evictExpired();
         String chosenModel = resolveModel(model);
+        if (executor.getQueue().remainingCapacity() == 0) {
+            // Known before the upload is copied: a client cannot make the server write 500 MB to refuse it.
+            throw new SpeechRecognitionException("Transcription queue is full, try again later");
+        }
         boolean shouldRefine = (refine == null ? properties.refiner().enabled() : refine)
                 && properties.refiner().enabled();
 
@@ -123,11 +135,21 @@ public class TranscriptionJobService implements AutoCloseable {
         try {
             state.stage(Stage.CONVERTING, 0.02);
             Path normalized = state.jobDir.resolve("normalized.wav");
-            converter.convert(uploaded, normalized);
+            try {
+                converter.convert(uploaded, normalized);
+            } catch (RuntimeException e) {
+                log.warn("Converting the upload of job {} failed", state.jobId, e);
+                throw new JobFailure("The audio file could not be converted, "
+                        + "check that it is a valid audio or video file");
+            }
             Files.deleteIfExists(uploaded);
             state.checkCancelled();
 
             Wav.Info wavInfo = Wav.read(normalized);
+            if (!wavInfo.isPcm16Mono(properties.sampleRate())) {
+                throw new JobFailure("The converted audio is not 16-bit mono at "
+                        + properties.sampleRate() + " Hz; check stt.ffmpeg.command");
+            }
             state.durationSeconds = roundMillis(wavInfo.durationSeconds());
 
             state.stage(Stage.DETECTING_SPEECH, 0.08);
@@ -177,7 +199,8 @@ public class TranscriptionJobService implements AutoCloseable {
                 return;
             }
             log.warn("Transcription job {} failed", state.jobId, e);
-            state.fail(e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage());
+            // The log has the cause; the client gets only messages written for it, never paths or tool output.
+            state.fail(e instanceof JobFailure ? e.getMessage() : "Transcription failed, see the server log");
         } finally {
             deleteQuietly(state.jobDir);
         }
@@ -212,7 +235,8 @@ public class TranscriptionJobService implements AutoCloseable {
             if (!piece.isEmpty()) {
                 batches.add(piece);
             }
-            start = end + 1;
+            // Only a space is the separator; a cut inside a word keeps the character it lands on.
+            start = end < text.length() && text.charAt(end) == ' ' ? end + 1 : end;
         }
         return batches;
     }
@@ -260,9 +284,39 @@ public class TranscriptionJobService implements AutoCloseable {
     @Override
     public void close() {
         executor.shutdownNow();
+        // Queued jobs never run, so nothing else removes their uploads; a running one cleans up in its own finally.
+        jobs.values().forEach(state -> {
+            state.cancel();
+            deleteQuietly(state.jobDir);
+        });
+        jobs.clear();
+        if (ownsRoot) {
+            deleteQuietly(jobsRoot);
+        }
+    }
+
+    /**
+     * Jobs live in memory, so after a restart every job directory left in a configured root is orphaned. Only
+     * directories named like a job id are removed, in case the root is shared with something else.
+     */
+    private static void sweepStaleJobDirectories(Path root) {
+        try (Stream<Path> children = Files.list(root)) {
+            children.filter(Files::isDirectory)
+                    .filter(dir -> JOB_DIRECTORY.matcher(dir.getFileName().toString()).matches())
+                    .forEach(TranscriptionJobService::deleteQuietly);
+        } catch (IOException e) {
+            log.warn("Could not look for old job directories in {}", root, e);
+        }
     }
 
     private static final class CancelledException extends RuntimeException {
+    }
+
+    /** A failure whose message was written for the client, unlike the exceptions the tools and models throw. */
+    private static final class JobFailure extends RuntimeException {
+        JobFailure(String message) {
+            super(message);
+        }
     }
 
     private static final class JobState {

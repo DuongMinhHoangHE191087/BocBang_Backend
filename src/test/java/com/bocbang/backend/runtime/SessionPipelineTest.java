@@ -15,6 +15,7 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 
@@ -283,6 +284,51 @@ class SessionPipelineTest {
         await().atMost(5, TimeUnit.SECONDS).until(() -> listener.events.size() == 1);
         assertThat(listener.events.get(0)).isEqualTo(TranscriptEvent.finalResult("done"));
         assertThat(listener.failures).isEmpty();
+    }
+
+    @Test
+    void closesTheSessionWhenTheEngineKeepsRejectingInputInARow() {
+        session.failure = new IllegalArgumentException("always refuses");
+        SessionPipeline pipeline = new SessionPipeline(session, executor, listener, MAX_BUFFERED, MAX_BATCH);
+
+        for (int i = 0; i < SessionPipeline.MAX_CONSECUTIVE_REJECTIONS + 5; i++) {
+            pipeline.offer(new byte[100]);
+        }
+
+        await().atMost(5, TimeUnit.SECONDS).until(() -> listener.failures.size() == 1);
+        assertThat(listener.rejections).hasSize(SessionPipeline.MAX_CONSECUTIVE_REJECTIONS - 1);
+    }
+
+    @Test
+    void countsRejectionsOnlyWhenTheyComeInARow() {
+        AtomicInteger calls = new AtomicInteger();
+        session.onAccept = () -> {
+            if (calls.incrementAndGet() % 10 != 0) {
+                throw new IllegalArgumentException("sometimes refuses");
+            }
+        };
+        SessionPipeline pipeline = new SessionPipeline(session, executor, listener, MAX_BUFFERED, MAX_BATCH);
+        int chunks = SessionPipeline.MAX_CONSECUTIVE_REJECTIONS * 2;
+
+        for (int i = 0; i < chunks; i++) {
+            pipeline.offer(new byte[100]);
+        }
+
+        await().atMost(5, TimeUnit.SECONDS).until(() -> session.receivedBytes() == chunks / 10 * 100);
+        assertThat(listener.failures).isEmpty();
+    }
+
+    @Test
+    void reportsAnEndThatTheEngineRefusedAsARecognitionFailure() {
+        session.finishFailure = new IllegalArgumentException("Unknown ASR model 'x'");
+        SessionPipeline pipeline = new SessionPipeline(session, executor, listener, MAX_BUFFERED, MAX_BATCH);
+
+        pipeline.finish();
+
+        await().atMost(5, TimeUnit.SECONDS).until(() -> listener.rejections.size() == 1);
+        assertThat(listener.rejections.get(0))
+                .as("every end is answered by a final or by recognition_failed, never by an audio error")
+                .isInstanceOf(SpeechRecognitionException.class);
     }
 
     @Test

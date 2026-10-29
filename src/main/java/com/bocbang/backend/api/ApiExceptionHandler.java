@@ -37,7 +37,10 @@ public class ApiExceptionHandler extends ResponseEntityExceptionHandler {
 
     @ExceptionHandler(SpeechRecognitionException.class)
     public ProblemDetail handleRecognitionFailure(SpeechRecognitionException e) {
-        return ProblemDetail.forStatusAndDetail(HttpStatus.SERVICE_UNAVAILABLE, e.getMessage());
+        // The message can carry model paths or native output; the log keeps it, the client does not get it.
+        LOG.warn("Recognition failed: {}", e.getMessage(), e);
+        return ProblemDetail.forStatusAndDetail(HttpStatus.SERVICE_UNAVAILABLE,
+                "Recognition is unavailable right now, try again later");
     }
 
     @ExceptionHandler(Exception.class)
