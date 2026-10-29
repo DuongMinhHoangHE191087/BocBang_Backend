@@ -27,4 +27,4 @@ Máy 16 GB, dùng script chung `~/.claude/scripts/jvm-ondemand.ps1` (xem `~/.cla
 
 ## Kiểm tra nhanh không cần model
 
-`./gradlew test` chạy test đơn vị cho runtime đa luồng, engine giả và `SttEndToEndTest` (khởi động cả server trên cổng ngẫu nhiên với `FakeSpeechToTextEngine`). `VoskSpeechEngineTest` tự bỏ qua khi `models/vosk-model-small-vn-0.4` chưa có. Thử tải: `node tools/load-test.mjs` (Node 22+) với server đang chạy.
+`./gradlew test` chạy test đơn vị cho runtime đa luồng, engine giả và `SttEndToEndTest` (khởi động cả server trên cổng ngẫu nhiên với `FakeSpeechToTextEngine`). `VoskSpeechEngineTest` tự bỏ qua khi `models/vosk-model-small-vn-0.4` chưa có. Thử tải: `node tools/load-test.mjs host:port số-kết-nối số-giây file.wav` (Node 22+) với server đang chạy. Model Vosk nằm ở `models/` (đã ignore); máy dev đã có sẵn, tải lại từ alphacephei.com/vosk/models nếu thiếu. Đo sức chứa luôn dùng tiếng nói thật, không dùng im lặng. Khi đo, tắt hết tiến trình nền nặng, nếu không số đo sai (từng gấp 3 lần).

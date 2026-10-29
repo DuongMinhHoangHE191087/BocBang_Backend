@@ -43,6 +43,12 @@ public class MockSpeechEngine implements SpeechToTextEngine {
         return "mock";
     }
 
+    /** The mock costs almost nothing, so demos can show many streams per worker. */
+    @Override
+    public int sessionsPerWorker() {
+        return 4;
+    }
+
     @Override
     public SpeechSession openSession(int sampleRate) {
         return new MockSession(sampleRate);

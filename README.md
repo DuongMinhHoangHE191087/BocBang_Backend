@@ -117,7 +117,7 @@ Cấu hình trong `application.yml` (hoặc biến môi trường dạng `STT_PO
 |---|---|---|
 | `stt.engine` | `vosk` | `vosk` hoặc `mock` hoặc tên engine bạn thêm |
 | `stt.pool.workers` | 0 (số CPU trừ 1) | Số thread nhận dạng |
-| `stt.pool.max-sessions` | 0 (4 mỗi worker) | Số luồng tối đa cùng lúc. Con số mặc định là ước lượng thận trọng, hãy đo với model thật rồi đặt lại |
+| `stt.pool.max-sessions` | 0 (số worker nhân `sessionsPerWorker` của engine) | Số luồng tối đa cùng lúc. Vosk khai báo 1 mỗi worker, `mock` khai báo 4. Đây vẫn là mức thận trọng, hãy đo với dữ liệu thật của bạn rồi đặt lại (xem "Đo sức chứa thật") |
 | `stt.session.max-buffered-audio` | 5s | Âm thanh chờ tối đa của một client |
 | `stt.session.max-batch-audio` | 500ms | Âm thanh gộp tối đa mỗi lần gọi model |
 | `stt.websocket.allowed-origins` | `*` | Origin được phép. Giới hạn lại trước khi public |
@@ -126,13 +126,24 @@ Cấu hình trong `application.yml` (hoặc biến môi trường dạng `STT_PO
 
 ### Đo sức chứa thật
 
-`tools/load-test.mjs` (cần Node 22 trở lên) mở N kết nối, mỗi kết nối phát âm thanh im lặng ở tốc độ thật và in phân vị `lagMs`:
+`tools/load-test.mjs` (cần Node 22 trở lên) mở N kết nối, mỗi kết nối phát âm thanh ở tốc độ thật và in phân vị `lagMs`:
 
 ```
-node tools/load-test.mjs localhost:8080 24 10
+node tools/load-test.mjs localhost:8080 6 25 tiengnoi.wav
 ```
 
-Tăng số kết nối đến khi p95 của `lagMs` vượt mức chấp nhận được (ví dụ 300 ms), lấy mức đó làm cơ sở cho `stt.pool.max-sessions`. Im lặng chỉ là cận dưới của tải thật; hãy đo lại bằng file tiếng nói thật ở trang demo.
+Đối số: `host:port`, số kết nối, số giây, và file WAV 16 kHz mono 16-bit (tùy chọn). **Luôn đo bằng file tiếng nói thật.** Không có file thì tool phát im lặng, và im lặng giải mã nhanh gấp khoảng 10 lần tiếng nói nên cho con số quá lạc quan.
+
+Số đo tham khảo (Vosk `small-vn-0.4`, máy 8 nhân logic đang chạy thêm các ứng dụng khác, 7 worker, clip tiếng Anh liên tục nên là tải nặng): một luồng tốn khoảng 0.6 nhân (RTF 0.6, riêng đoạn đầu clip 1.1).
+
+| Luồng | `lagMs` p50 / p95 | Kết quả |
+|---|---|---|
+| 1 | 0.3 s / 1.5 s | theo kịp |
+| 4 | 0.5 s / 2.3 s | theo kịp |
+| 6 | 1.6 s / 3.7 s | bắt đầu tụt |
+| 8 trở lên | p95 trên 5 s | các luồng bị ngắt với `overloaded` |
+
+Trên máy đó, `stt.pool.max-sessions` khoảng 4 đến 5 là hợp lý. Số của bạn sẽ khác: tăng dần số kết nối đến khi p95 của `lagMs` vượt mức bạn chấp nhận được (ví dụ 2 giây), rồi đặt `max-sessions` thấp hơn mức đó một chút. Quá mức đó, server vẫn tự bảo vệ: client tụt quá `max-buffered-audio` bị ngắt, nhưng đặt đúng `max-sessions` thì người dùng thừa được từ chối ngay từ cửa (`capacity_exceeded`) thay vì bị ngắt giữa chừng.
 
 ## Cắm model AI khác
 
@@ -140,13 +151,14 @@ Mô hình được viết thêm chỉ cần:
 
 1. Tạo package mới, ví dụ `stt/whisper/`, với một class `@Component` implement `SpeechToTextEngine` (xem `stt/mock/MockSpeechEngine` làm mẫu ngắn nhất).
 2. Gắn `@ConditionalOnProperty(prefix = "stt", name = "engine", havingValue = "whisper")` để chọn bằng `STT_ENGINE=whisper`.
-3. Tạo test kế thừa `SpeechToTextEngineContract` (trong `src/test/.../stt/`) và trả engine của bạn từ `engine()`. Bộ test này kiểm tra những điều runtime dùng chung đòi hỏi: nhiều phiên mở song song, `finish()` luôn trả `FINAL`, `close()` gọi hai lần không lỗi.
+3. Tạo test kế thừa `SpeechToTextEngineContract` (trong `src/test/.../stt/`) và trả engine của bạn từ `engine()` (xem `VoskSpeechEngineContractTest`). Bộ test này kiểm tra những điều runtime dùng chung đòi hỏi: nhiều phiên mở song song, `finish()` luôn trả `FINAL`, `close()` gọi hai lần không lỗi.
 
 Quy ước engine phải giữ:
 
 - `openSession` được gọi đồng thời từ nhiều thread. Model nạp một lần và dùng chung.
 - `SpeechSession` chỉ bị một thread dùng tại một thời điểm (runtime bảo đảm), nhưng các lần gọi có thể đến từ các thread khác nhau. Không dùng `ThreadLocal`.
 - `accept` nên trả về nhanh trong vài chục mili giây cho 100–500 ms âm thanh; nó chiếm một worker trong lúc chạy.
+- Ghi đè `sessionsPerWorker()` (mặc định 1) để khai báo mỗi worker chịu được bao nhiêu luồng realtime. Chỉ tăng khi đã đo bằng `tools/load-test.mjs` với tiếng nói thật. Giá trị này quyết định mặc định của `stt.pool.max-sessions`.
 - Không sửa `websocket/` hay `api/` khi thêm engine.
 
 ## Kiến trúc
@@ -170,7 +182,7 @@ com.bocbang.backend
 ./gradlew test --no-daemon
 ```
 
-Test chạy ngay không cần model: đơn vị cho runtime đa luồng, engine giả, và `SttEndToEndTest` khởi động cả server trên cổng ngẫu nhiên rồi nói chuyện qua WebSocket và HTTP thật. `VoskSpeechEngineTest` nạp model thật và chỉ chạy khi có `models/vosk-model-small-vn-0.4`.
+Test chạy ngay không cần model: đơn vị cho runtime đa luồng, engine giả, và `SttEndToEndTest` khởi động cả server trên cổng ngẫu nhiên rồi nói chuyện qua WebSocket và HTTP thật. `VoskSpeechEngineTest` và `VoskSpeechEngineContractTest` nạp model thật và chỉ chạy khi có `models/vosk-model-small-vn-0.4`.
 
 ## Lưu ý khi triển khai
 

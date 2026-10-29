@@ -27,6 +27,11 @@ public abstract class SpeechToTextEngineContract {
     }
 
     @Test
+    void sustainsAtLeastOneStreamPerWorker() {
+        assertThat(engine().sessionsPerWorker()).isGreaterThanOrEqualTo(1);
+    }
+
+    @Test
     void finishAlwaysReturnsAFinalTranscript() {
         try (SpeechSession session = engine().openSession(SAMPLE_RATE)) {
             session.accept(silence(250), silence(250).length);

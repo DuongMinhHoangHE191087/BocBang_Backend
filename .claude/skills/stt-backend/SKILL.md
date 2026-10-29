@@ -33,7 +33,7 @@ Lỗi luôn có `code` (`invalid_sample_rate`, `capacity_exceeded`, `overloaded`
 
 - `SpeechSession` không thread-safe. `SessionPipeline` bảo đảm một thread tại một thời điểm, theo đúng thứ tự đến, nhưng các lần gọi có thể đến từ các worker khác nhau (không dùng `ThreadLocal`).
 - Model Vosk được nạp một lần khi khởi động. Nếu thiếu thư mục model, server dừng ngay với thông báo đường dẫn (dùng `STT_ENGINE=mock` để chạy khi chưa có model).
-- Số luồng tối đa mặc định là 4 mỗi worker, chỉ là ước lượng. Phải đo bằng model thật (`tools/load-test.mjs` và chỉ số `stt.queue.wait`) rồi đặt `stt.pool.max-sessions`.
+- Số luồng tối đa mặc định = số worker nhân `SpeechToTextEngine.sessionsPerWorker()` (Vosk 1, mock 4). Vosk thật tốn khoảng 0.6 đến 1.1 nhân mỗi luồng với tiếng nói liên tục, nên phải đo bằng `tools/load-test.mjs` với file tiếng nói thật (im lặng nhanh gấp ~10 lần, cho số sai) và chỉ số `stt.queue.wait`, rồi đặt `stt.pool.max-sessions`.
 - Container WebSocket mặc định chỉ nhận frame nhị phân 8 KB; `WebSocketConfig` nâng lên `stt.websocket.max-frame-bytes`.
 - Máy chủ chỉ chạy trên PC/server. App Android là client, không chạy Spring Boot trong APK.
 - `AudioSystem.getAudioInputStream` cần luồng hỗ trợ mark/reset, nên `TranscriptionService` bọc `BufferedInputStream`.

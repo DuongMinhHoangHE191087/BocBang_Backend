@@ -36,6 +36,16 @@ public class VoskSpeechEngine implements SpeechToTextEngine, AutoCloseable {
         return "vosk";
     }
 
+    /**
+     * Measured with the small Vietnamese model on continuous speech: about 0.6 to 1.1 core per stream, so one
+     * stream per worker is the most this can promise. Quieter or in-domain audio is cheaper; raise
+     * {@code stt.pool.max-sessions} after measuring your own traffic.
+     */
+    @Override
+    public int sessionsPerWorker() {
+        return 1;
+    }
+
     @Override
     public SpeechSession openSession(int sampleRate) {
         try {

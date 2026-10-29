@@ -32,17 +32,15 @@ public record SttProperties(
     public record Pool(
             /** Inference threads. 0 means CPU count minus one, leaving a core for the web server. */
             @DefaultValue("0") int workers,
-            /** Concurrent streams (WebSocket sessions and file uploads). 0 means four per worker. */
+            /** Concurrent streams (WebSocket sessions and file uploads). 0 means workers times the engine's own figure. */
             @DefaultValue("0") int maxSessions) {
-
-        private static final int SESSIONS_PER_WORKER = 4;
 
         public int resolvedWorkers() {
             return workers > 0 ? workers : Math.max(1, Runtime.getRuntime().availableProcessors() - 1);
         }
 
-        public int resolvedMaxSessions() {
-            return maxSessions > 0 ? maxSessions : resolvedWorkers() * SESSIONS_PER_WORKER;
+        public int resolvedMaxSessions(int engineSessionsPerWorker) {
+            return maxSessions > 0 ? maxSessions : resolvedWorkers() * engineSessionsPerWorker;
         }
     }
 

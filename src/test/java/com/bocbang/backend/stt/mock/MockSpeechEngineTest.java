@@ -48,6 +48,11 @@ class MockSpeechEngineTest extends SpeechToTextEngineContract {
     }
 
     @Test
+    void isCheapEnoughToShowSeveralStreamsPerWorker() {
+        assertThat(engine().sessionsPerWorker()).isGreaterThan(1);
+    }
+
+    @Test
     void reportsAPartialOnlyWhenItsTextChanged() {
         MockSpeechEngine engine = new MockSpeechEngine(TestSettings.properties("mock.segment", "10s"));
         try (SpeechSession session = engine.openSession(16000)) {
