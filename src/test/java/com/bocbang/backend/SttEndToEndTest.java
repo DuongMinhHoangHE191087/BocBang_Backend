@@ -145,6 +145,19 @@ class SttEndToEndTest {
     }
 
     @Test
+    void marksTheOlderPathAsDeprecatedAndPointsToTheVersionedOne() throws Exception {
+        HttpResponse<String> older = get("/api/stt/status");
+        HttpResponse<String> current = get("/api/v1/stt/status");
+
+        assertThat(older.headers().firstValue("Deprecation")).isPresent();
+        assertThat(older.headers().firstValue("Link").orElse(""))
+                .contains("</api/v1/stt/status>")
+                .contains("rel=\"successor-version\"");
+        assertThat(current.headers().firstValue("Deprecation")).isEmpty();
+        assertThat(current.headers().firstValue("Link")).isEmpty();
+    }
+
+    @Test
     void transcribesAnUploadedWavFile() throws Exception {
         HttpResponse<String> response = postWav("/api/v1/stt/transcriptions", wav(new byte[16000 * 2]));
 

@@ -63,7 +63,16 @@ public class TranscriptionService {
                 throw new IllegalArgumentException(
                         "WAV sample rate must be " + properties.sampleRate() + " Hz, got " + sampleRate);
             }
-            pcm = audio.readAllBytes();
+            // Uploads may be hundreds of MB for the job endpoint; this one holds the audio in memory, so it reads
+            // one frame past the limit to tell "too long" from "exactly at the limit" without reading the rest.
+            // It must be a whole frame: AudioInputStream answers 0 to a partial-frame read, and readNBytes then
+            // spins on that 0 forever.
+            int limit = properties.maxUtteranceBytes();
+            pcm = audio.readNBytes(limit + Math.max(1, format.getFrameSize()));
+            if (pcm.length > limit) {
+                throw new IllegalArgumentException("Audio is longer than the " + properties.maxUtteranceSeconds()
+                        + " s limit for synchronous transcription, send it to /api/v1/stt/jobs instead");
+            }
         } catch (UnsupportedAudioFileException e) {
             throw new IllegalArgumentException("File is not a valid WAV audio", e);
         }
