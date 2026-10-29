@@ -79,6 +79,15 @@ class SttSecurityEndToEndTest {
     }
 
     @Test
+    void protectsTheJobEndpointsToo() throws Exception {
+        assertThat(get("/api/v1/stt/jobs/missing", null).statusCode()).isEqualTo(401);
+        assertThat(get("/api/stt/jobs/missing", null).statusCode()).isEqualTo(401);
+        assertThat(get("/api/v1/stt/jobs/missing", "Bearer secret-one").statusCode())
+                .as("with a key the request reaches the controller, which does not know the job")
+                .isEqualTo(404);
+    }
+
+    @Test
     void keepsProbesAndTheDemoPageOpen() throws Exception {
         assertThat(get("/actuator/health/readiness", null).statusCode()).isEqualTo(200);
         assertThat(get("/actuator/health", null).statusCode()).isEqualTo(200);

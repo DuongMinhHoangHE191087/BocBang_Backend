@@ -21,6 +21,8 @@ import java.util.concurrent.CompletionStage;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import javax.sound.sampled.AudioFileFormat;
 import javax.sound.sampled.AudioFormat;
 import javax.sound.sampled.AudioInputStream;
@@ -154,6 +156,35 @@ class SttEndToEndTest {
     }
 
     @Test
+    void runsALongAudioJobAndServesItOnTheVersionedAndTheOlderPaths() throws Exception {
+        HttpResponse<String> submitted = postWav("/api/v1/stt/jobs?refine=false", wav(new byte[16000 * 2 * 2]));
+
+        assertThat(submitted.statusCode()).isEqualTo(202);
+        assertThat(submitted.headers().firstValue("Location").orElse("")).startsWith("/api/v1/stt/jobs/");
+        String jobId = jobId(submitted.body());
+
+        await().atMost(15, TimeUnit.SECONDS)
+                .until(() -> get("/api/stt/jobs/" + jobId).body().contains("\"status\":\"DONE\""));
+        assertThat(get("/api/v1/stt/jobs/" + jobId).body()).contains("\"text\":\"xin chào\"");
+        assertThat(delete("/api/v1/stt/jobs/" + jobId).statusCode()).isEqualTo(204);
+        assertThat(get("/api/v1/stt/jobs/" + jobId).statusCode()).isEqualTo(404);
+    }
+
+    @Test
+    void answers404ForAJobThatDoesNotExist() throws Exception {
+        assertThat(get("/api/v1/stt/jobs/does-not-exist").statusCode()).isEqualTo(404);
+        assertThat(delete("/api/v1/stt/jobs/does-not-exist").statusCode()).isEqualTo(404);
+    }
+
+    @Test
+    void refusesAnEmptyJobUploadAsAClientMistake() throws Exception {
+        HttpResponse<String> response = postWav("/api/v1/stt/jobs", new byte[0]);
+
+        assertThat(response.statusCode()).isEqualTo(400);
+        assertThat(response.headers().firstValue("Content-Type").orElse("")).contains("application/problem+json");
+    }
+
+    @Test
     void answers503WithRetryAfterWhenNoRecognitionSlotIsFree() throws Exception {
         List<SessionLimiter.Permit> taken = new ArrayList<>();
         for (int i = 0; i < 3; i++) {
@@ -205,6 +236,16 @@ class SttEndToEndTest {
 
     private HttpResponse<String> get(String path) throws Exception {
         return http.send(HttpRequest.newBuilder(uri(path)).GET().build(), HttpResponse.BodyHandlers.ofString());
+    }
+
+    private HttpResponse<String> delete(String path) throws Exception {
+        return http.send(HttpRequest.newBuilder(uri(path)).DELETE().build(), HttpResponse.BodyHandlers.ofString());
+    }
+
+    private static String jobId(String body) {
+        Matcher matcher = Pattern.compile("\"jobId\":\"([^\"]+)\"").matcher(body);
+        assertThat(matcher.find()).as("a jobId in " + body).isTrue();
+        return matcher.group(1);
     }
 
     private HttpResponse<String> postWav(String path, byte[] file) throws Exception {
