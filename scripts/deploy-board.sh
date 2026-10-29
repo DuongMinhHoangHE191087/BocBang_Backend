@@ -127,6 +127,9 @@ if [ "$(id -u)" != "0" ]; then
     exit 1
 fi
 
+# Protect the server process from Android lmkd / OOM killer during 2.5 GB LLM loads
+echo -900 > /proc/$$/oom_score_adj 2>/dev/null || true
+
 mountpoint -q "${ROOTFS}/proc"   || mount -t proc proc "${ROOTFS}/proc"
 mountpoint -q "${ROOTFS}/sys"    || mount --bind /sys "${ROOTFS}/sys"
 mountpoint -q "${ROOTFS}/dev"    || mount --bind /dev "${ROOTFS}/dev"
@@ -152,10 +155,22 @@ exec /system/bin/chroot "${ROOTFS}" /opt/jre/bin/java \
     -jar /opt/bocbang/bocbang-backend.jar "$@"
 EOF
 
+BG_LAUNCHER="$(mktemp)"
+cat > "${BG_LAUNCHER}" <<'EOF'
+#!/system/bin/sh
+set -e
+BOARD_DIR="/data/local/tmp/bocbang"
+pkill -f "bocbang-backend.jar" 2>/dev/null || true
+sleep 1
+setsid "${BOARD_DIR}/run.sh" </dev/null >"${BOARD_DIR}/server.log" 2>&1 &
+echo "Started bocbang-backend in detached daemon mode (PID $!). Logs: ${BOARD_DIR}/server.log"
+EOF
+
 adb push "${LAUNCHER}" "${BOARD_DIR}/run.sh"
-rm -f "${LAUNCHER}"
-adb shell "chmod 755 '${BOARD_DIR}/run.sh'"
+adb push "${BG_LAUNCHER}" "${BOARD_DIR}/start-bg.sh"
+rm -f "${LAUNCHER}" "${BG_LAUNCHER}"
+adb shell "chmod 755 '${BOARD_DIR}/run.sh' '${BOARD_DIR}/start-bg.sh'"
 
 echo "=== Deployed successfully to ${BOARD_DIR} ==="
-echo "Forward port:  adb forward tcp:8099 tcp:8099"
-echo "Start server:  adb shell ${BOARD_DIR}/run.sh"
+echo "Start detached daemon on board:  adb shell ${BOARD_DIR}/start-bg.sh"
+echo "Expose on Wi-Fi LAN:             ./scripts/expose-lan.sh"
