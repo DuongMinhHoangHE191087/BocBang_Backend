@@ -11,7 +11,8 @@
   const SPEECH_RMS = 0.015; // frame loudness that counts as speech
   const PAUSE_FRAMES = 8; // 0.8 s of quiet closes an utterance
   const MIN_SPEECH_FRAMES = 3;
-  const MAX_UTTERANCE_FRAMES = 250; // 25 s, well inside the server's 60 s limit
+  const PREROLL_FRAMES = 3; // 0.3 s kept from before the first loud frame, so the start of a word is not clipped
+  const MAX_UTTERANCE_FRAMES = 250; // 25 s of audio sent since the last end, well inside the server's 60 s limit
 
   const $ = (id) => document.getElementById(id);
   const el = {
@@ -67,6 +68,8 @@
         const fail = (error) => { if (!settled) { settled = true; reject(error); } };
         ws.onmessage = (event) => {
           const message = JSON.parse(event.data);
+          // Every end is answered by a final or by recognition_failed. A streaming engine can also send finals nobody
+          // asked for; those cannot be told apart here, so the count never goes below zero.
           if (message.type === 'final' || message.code === 'recognition_failed') {
             this.pendingEnds = Math.max(0, this.pendingEnds - 1);
           }
@@ -400,38 +403,54 @@
     tiles.clear();
     ribbon.reset();
     Object.assign(run, { frames: 0, recentLags: [], lagMax: 0, connections: [] });
-    Object.assign(utterance, { loud: 0, quiet: 0, total: 0 });
+    resetUtterance();
     renderStats();
   }
 
-  const utterance = { loud: 0, quiet: 0, total: 0 };
+  /**
+   * Audio goes to the server only while someone is speaking. Quiet before the first word is not sent: a minute of
+   * silence would otherwise fill the server's utterance limit before the speaker says anything. An utterance is
+   * closed with end when the speaker pauses, or when 25 s of audio has been sent since the last end.
+   */
+  const utterance = { speaking: false, loud: 0, quiet: 0, sent: 0, preroll: [] };
+  const resetUtterance = () => Object.assign(utterance, { speaking: false, loud: 0, quiet: 0, sent: 0, preroll: [] });
 
-  /** Closes the current utterance when the speaker pauses, or runs on too long, by sending end on every stream. */
-  function trackPause(rms) {
-    if (rms >= SPEECH_RMS) {
-      utterance.loud++;
-      utterance.quiet = 0;
-    } else if (utterance.loud > 0) {
-      utterance.quiet++;
-    }
-    if (utterance.loud > 0) {
-      utterance.total++;
-    }
-    const paused = utterance.quiet >= PAUSE_FRAMES;
-    const tooLong = utterance.total >= MAX_UTTERANCE_FRAMES;
-    if ((paused && utterance.loud >= MIN_SPEECH_FRAMES) || tooLong) {
-      run.connections.forEach((connection) => connection.end());
-    }
-    if (paused || tooLong) {
-      Object.assign(utterance, { loud: 0, quiet: 0, total: 0 });
-    }
+  function sendToAll(frame) {
+    run.connections.forEach((connection) => connection.sendPcm(frame));
+    run.frames++;
+    utterance.sent++;
   }
 
   function onFrame(frame, rms) {
-    run.frames++;
     ribbon.push(rms);
-    run.connections.forEach((connection) => connection.sendPcm(frame));
-    trackPause(rms);
+    const loud = rms >= SPEECH_RMS;
+    if (!utterance.speaking) {
+      if (!loud) {
+        utterance.preroll.push(frame);
+        if (utterance.preroll.length > PREROLL_FRAMES) {
+          utterance.preroll.shift();
+        }
+        return;
+      }
+      utterance.speaking = true;
+      utterance.preroll.forEach(sendToAll);
+      utterance.preroll = [];
+    }
+    sendToAll(frame);
+    if (loud) {
+      utterance.loud++;
+      utterance.quiet = 0;
+    } else {
+      utterance.quiet++;
+    }
+    const paused = utterance.quiet >= PAUSE_FRAMES;
+    if ((paused && utterance.loud >= MIN_SPEECH_FRAMES) || utterance.sent >= MAX_UTTERANCE_FRAMES) {
+      run.connections.forEach((connection) => connection.end());
+      resetUtterance();
+    } else if (paused) {
+      // A burst too short to be speech: stop streaming, but keep the sent count so the server-side total stays bounded.
+      Object.assign(utterance, { speaking: false, loud: 0, quiet: 0, preroll: [] });
+    }
     if (run.frames % 5 === 0) {
       renderStats();
     }
