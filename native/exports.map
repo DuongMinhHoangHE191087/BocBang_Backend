@@ -1,0 +1,7 @@
+{
+  global:
+    JNI_OnLoad;
+    Java_com_bocbang_backend_stt_jni_*;
+  local:
+    *;
+};
