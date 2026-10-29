@@ -1,24 +1,58 @@
 # BocBang Backend
 
-Backend Spring Boot nhận âm thanh qua WebSocket, chuyển thành văn bản bằng model nhận dạng giọng nói chạy trên CPU (Vosk, offline), và trả kết quả realtime về client. Kèm REST `/api` để kiểm tra và chuyển một file WAV thành văn bản.
+Backend Spring Boot chạy trên board MediaTek G520 (ARMv8.2-A CPU), tích hợp trực tiếp **C++ JNI** (`native/`) để nạp và chạy 4 model GGML/GGUF ngay trong bộ nhớ mà không cần gọi tiến trình CLI bên ngoài.
 
-## Yêu cầu
+## Kiến trúc C++ JNI & 4 Model
 
-- JDK 17 trở lên (Spring Boot 4 yêu cầu Java 17+). Gradle wrapper đi kèm, không cần cài Gradle.
-- Model Vosk (ví dụ `vosk-model-small-vn-0.4`, tiếng Việt) đã được chuẩn bị riêng, không nằm trong repo. Nguồn model: https://alphacephei.com/vosk/models
+Mỗi thư viện C++ (`transcribe.cpp`, `whisper.cpp`, `llama.cpp`) đi kèm phiên bản `ggml` riêng, nên module `native/` biên dịch thành **3 file `.so` độc lập** có ẩn toàn bộ symbol nội bộ (`exports.map` + `-fvisibility=hidden`) để nạp chung vào cùng một JVM không xung đột:
 
-## Đặt model
+| Thư viện JNI | Engine C++ | Model phụ trách | Vai trò |
+|---|---|---|---|
+| `libbocbang_whisper.so` | `whisper.cpp` | `ggml-silero-vad.bin` + `whisper-small-en.bin` | Tách đoạn tiếng nói (Silero VAD) & ASR tiếng Anh (`whisper-en`) |
+| `libbocbang_transcribe.so` | `transcribe.cpp` | `qwen3-asr-1.7b-q4_k_m.gguf` | ASR đa ngôn ngữ / tiếng Việt (`qwen3-asr`) |
+| `libbocbang_llama.so` | `llama.cpp` | `qwen3-4b-instruct-2507-q4_k_m.gguf` | Thêm dấu câu, viết hoa, sửa lỗi nhận dạng (Refiner) |
 
-Đặt thư mục model đã giải nén vào `models/vosk-model-small-vn-0.4` ở thư mục gốc dự án, hoặc chỉ định đường dẫn khác bằng biến môi trường `STT_VOSK_MODEL_PATH`. Thư mục `models/` đã nằm trong `.gitignore`. Nếu model không tồn tại, server dừng ngay khi khởi động và báo đường dẫn đang tìm.
+Tất cả model nhận âm thanh **16 kHz, 16-bit, mono** (chuyển sang `float[]` chuẩn hóa `[-1.0, 1.0)` ngay trong Java trước khi truyền qua JNI).
 
-## Chạy
+## Luồng xử lý file dài (5 phút – 1 giờ)
 
+1. Client gửi file (WAV, MP3, M4A, OGG, FLAC...) vào `POST /api/stt/jobs`. File ghi thẳng xuống đĩa, trả ngay `202 Accepted` kèm `jobId`.
+2. Worker chạy nền:
+   - `CONVERTING`: `ffmpeg` chuyển mọi định dạng về WAV 16 kHz 16-bit mono (nếu đã đúng chuẩn thì bỏ qua `ffmpeg`).
+   - `DETECTING_SPEECH`: quét Silero VAD qua JNI theo từng cửa sổ 5 phút (~19 MB heap) để tìm các đoạn có tiếng nói, gộp các đoạn gần nhau và cắt tối đa `30s`/đoạn.
+   - `TRANSCRIBING`: nạp model ASR (`qwen3-asr` hoặc `whisper-en`) **một lần duy nhất** vào RAM native, đọc từng đoạn `float[]` trực tiếp từ file WAV và gọi JNI. Cập nhật `progress` và `segments` sau mỗi đoạn.
+   - `REFINING`: nếu `stt.unload-before-refine: true` (mặc định), giải phóng ~1.3 GB của model ASR trước khi nạp ~2.5 GB của `qwen3-4b-instruct`, chia văn bản thành từng khúc (`max-batch-chars`) để sửa dấu câu & lỗi từ, sau đó giải phóng RAM.
+3. Nếu client gọi `DELETE /api/stt/jobs/{jobId}` hoặc quá `timeout`, `CpuExecutionGate` bật cờ `abort` nguyên tử trong C++ để dừng ngay đồ thị `ggml` đang chạy.
+
+## Biên dịch thư viện C++ JNI (`native/`)
+
+```bash
+# Biên dịch cho Android ARM64 (MediaTek G520 / Termux openjdk-17, dùng Android NDK armv8.2-a+dotprod+fp16)
+./scripts/build-native.sh android-arm64
+
+# Biên dịch cho Linux ARM64 glibc (nếu chạy trong Debian/Ubuntu chroot trên board)
+./scripts/build-native.sh linux-arm64
+
+# Biên dịch cho máy PC hiện tại (Linux x86_64) để test trực tiếp trên máy phát triển
+./scripts/build-native.sh host
 ```
-./gradlew bootRun          # Linux/macOS
-gradlew.bat bootRun        # Windows
+
+Kết quả `.so` nằm tại `native/dist/<target>/`. Có thể truyền biến môi trường `TRANSCRIBE_CPP_DIR`, `WHISPER_CPP_DIR`, `LLAMA_CPP_DIR`, `ANDROID_NDK_HOME` nếu đặt mã nguồn C++ ở đường dẫn khác.
+
+## Đẩy lên board MediaTek G520 và chạy
+
+1. Cài OpenJDK 17 và `ffmpeg` trên board (ví dụ trong Termux: `pkg install openjdk-17 ffmpeg`).
+2. Cắm cáp ADB và chạy script đóng gói + đẩy tự động:
+
+```bash
+# Đẩy JAR + 3 file .so (thêm PUSH_MODELS=/workspace/MeetingNotes-models nếu muốn đẩy cả 4 model)
+PUSH_MODELS=/workspace/MeetingNotes-models ./scripts/deploy-board.sh
+
+# Chạy server trên board
+adb shell /data/local/tmp/bocbang/run.sh
 ```
 
-Server chạy ở `http://localhost:8080`.
+Lưu ý trên Android: các file `.so` và script thực thi phải đặt trong `/data/local/tmp/...` hoặc `$HOME` của Termux (không đặt trên `/sdcard` vì phân vùng đó mount `noexec`).
 
 ## API
 
@@ -27,58 +61,26 @@ Server chạy ở `http://localhost:8080`.
 | Method | Đường dẫn | Mô tả |
 |---|---|---|
 | GET | `/api/health` | Kiểm tra server còn sống |
-| GET | `/api/stt/status` | Tên engine, sample rate mặc định, đường dẫn WebSocket |
-| POST | `/api/stt/transcriptions` | Multipart `file` là WAV 16-bit PCM mono, trả `{"text": "...", "sampleRate": 16000}` |
+| GET | `/api/stt/status` | Model mặc định, danh sách model, trạng thái refiner, sample rate |
+| POST | `/api/stt/jobs` | Tạo job cho file âm thanh dài (`?model=qwen3-asr\|whisper-en&refine=true`), trả `202` |
+| GET | `/api/stt/jobs/{jobId}` | Xem tiến độ (`0.0..1.0`), các đoạn đã xong và văn bản cuối cùng |
+| DELETE | `/api/stt/jobs/{jobId}` | Hủy job đang chạy (bật cờ abort trong C++) và xóa file tạm |
+| POST | `/api/stt/transcriptions` | Nhận dạng đồng bộ một file WAV 16 kHz 16-bit mono ngắn |
 
-```
-curl -F "file=@sample.wav" http://localhost:8080/api/stt/transcriptions
-```
-
-### WebSocket: `ws://<host>:8080/ws/stt?sampleRate=16000`
-
-`sampleRate` tùy chọn, mặc định 16000, chấp nhận 8000–48000.
-
-Client gửi:
-
-- **Binary frame**: PCM 16-bit little-endian, mono. Nên gửi mỗi 100–250 ms (ví dụ 3200–8000 byte ở 16 kHz).
-- **Text frame** `{"type":"end"}`: kết thúc câu hiện tại, server trả `final`.
-
-Server trả (JSON text):
-
-```json
-{"type":"ready","sampleRate":16000,"encoding":"pcm_s16le","channels":1}
-{"type":"partial","text":"xin chào"}
-{"type":"final","text":"xin chào các bạn"}
-{"type":"error","message":"..."}
+```bash
+curl -F "file=@meeting.m4a" "http://localhost:8080/api/stt/jobs?model=qwen3-asr&refine=true"
+curl http://localhost:8080/api/stt/jobs/<jobId>
 ```
 
-Với Android, `AudioRecord` ở `ENCODING_PCM_16BIT`, `CHANNEL_IN_MONO`, 16000 Hz đúng định dạng này, chỉ cần đẩy buffer vào frame nhị phân.
+### WebSocket: `ws://<host>:8080/ws/stt`
 
-## Kiến trúc
+- **Binary frame**: PCM 16-bit little-endian, mono, 16 kHz.
+- **Text frame** `{"type":"end"}`: kết thúc câu, chạy JNI trên model mặc định và trả `{"type":"final","text":"..."}`.
 
-```
-com.bocbang.backend
-├── api/              REST /api (health, stt status, transcriptions) + xử lý lỗi
-├── websocket/        WebSocket /ws/stt, đọc PCM và trả transcript
-└── stt/              Abstraction cho model nhận dạng
-    ├── SpeechToTextEngine   engine dùng chung (một model load một lần)
-    ├── SpeechSession        một phiên streaming (mỗi kết nối một phiên)
-    ├── TranscriptionService xử lý file WAV qua cùng engine
-    └── vosk/                cài đặt Vosk (VoskSpeechEngine, VoskSpeechSession)
-```
+## Kiểm tra trên PC
 
-Để đổi model (Whisper, Sherpa-ONNX...), chỉ cần thêm một class implement `SpeechToTextEngine` trong `stt/`. WebSocket và REST không cần sửa.
-
-## Test
-
-```
+```bash
+./scripts/build-native.sh host
+STT_MODEL_DIR=/workspace/MeetingNotes-models ./gradlew bootRun
 ./gradlew test
 ```
-
-Test engine giả chạy ngay. `VoskSpeechEngineTest` nạp model thật và chỉ chạy khi có `models/vosk-model-small-vn-0.4`.
-
-## Lưu ý khi triển khai
-
-- Spring Boot không chạy trực tiếp trong APK Android. Mô hình đúng là: app Android thu âm và gửi qua WebSocket tới server (PC/server/Raspberry Pi...).
-- `allowedOriginPatterns` đang là `*` để dev dễ. Trước khi public, giới hạn lại trong `WebSocketConfig`.
-- Vosk xử lý trên CPU, mỗi phiên tốn một `Recognizer`. Với nhiều kết nối đồng thời, cần đo lại tải CPU trên máy thực tế.

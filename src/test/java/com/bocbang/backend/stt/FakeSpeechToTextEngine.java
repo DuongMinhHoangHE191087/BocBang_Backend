@@ -11,8 +11,10 @@ public class FakeSpeechToTextEngine implements SpeechToTextEngine {
     private final String transcript;
 
     public final List<Integer> openedSampleRates = new ArrayList<>();
+    public final List<String> requestedModels = new ArrayList<>();
     public final AtomicInteger receivedBytes = new AtomicInteger();
     public final AtomicInteger closedSessions = new AtomicInteger();
+    public final AtomicInteger releasedCount = new AtomicInteger();
 
     public FakeSpeechToTextEngine(String transcript) {
         this.transcript = transcript;
@@ -21,6 +23,16 @@ public class FakeSpeechToTextEngine implements SpeechToTextEngine {
     @Override
     public String name() {
         return "fake";
+    }
+
+    @Override
+    public String defaultModel() {
+        return "qwen3-asr";
+    }
+
+    @Override
+    public List<String> models() {
+        return List.of("qwen3-asr", "whisper-en");
     }
 
     @Override
@@ -43,5 +55,16 @@ public class FakeSpeechToTextEngine implements SpeechToTextEngine {
                 closedSessions.incrementAndGet();
             }
         };
+    }
+
+    @Override
+    public String transcribe(String model, float[] samples) {
+        requestedModels.add(model);
+        return transcript;
+    }
+
+    @Override
+    public void releaseModels() {
+        releasedCount.incrementAndGet();
     }
 }

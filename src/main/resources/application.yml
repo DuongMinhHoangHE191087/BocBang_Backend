@@ -3,14 +3,87 @@ spring:
     name: bocbang-backend
   servlet:
     multipart:
-      max-file-size: 20MB
-      max-request-size: 20MB
+      # 1 hour of 16 kHz 16-bit mono WAV is ~115 MB; Uploads > 1 MB stream straight to disk.
+      max-file-size: 500MB
+      max-request-size: 500MB
+      file-size-threshold: 1MB
 
 server:
   port: 8080
 
 stt:
-  default-sample-rate: 16000
-  vosk:
-    # Relative to the working directory. Download: https://alphacephei.com/vosk/models (Vietnamese: vosk-model-small-vn-0.4)
-    model-path: ${STT_VOSK_MODEL_PATH:models/vosk-model-small-vn-0.4}
+  # Model baseline: 16 kHz mono PCM. Realtime endpoints reject other rates; long-audio jobs convert via ffmpeg.
+  sample-rate: 16000
+  max-utterance-seconds: 60
+  # CPU threads used inside transcribe.cpp, whisper.cpp, and llama.cpp (G520 has 2x A78 + 6x A55; 4 is optimal).
+  threads: ${STT_THREADS:4}
+  # Directory containing libbocbang_transcribe.so, libbocbang_whisper.so, libbocbang_llama.so.
+  # Leave blank to auto-detect native/dist/{android-arm64,linux-arm64,host} or java.library.path.
+  native-lib-dir: ${STT_NATIVE_LIB_DIR:}
+  # Unloads the ~1.3 GB ASR model before loading the ~2.5 GB Qwen 4B LLM so board RAM is never exceeded.
+  unload-before-refine: ${STT_UNLOAD_BEFORE_REFINE:true}
+  default-model: ${STT_DEFAULT_MODEL:qwen3-asr}
+
+  models:
+    # Multilingual / Vietnamese — loaded via libbocbang_transcribe.so (transcribe.cpp)
+    qwen3-asr:
+      backend: TRANSCRIBE_CPP
+      model-path: ${STT_QWEN_ASR_MODEL:${STT_MODEL_DIR:/data/local/tmp/bocbang/models}/qwen3-asr-1.7b-q4_k_m.gguf}
+      language: ${STT_QWEN_ASR_LANG:}
+      timeout: 5m
+
+    # English-only — loaded via libbocbang_whisper.so (whisper.cpp)
+    whisper-en:
+      backend: WHISPER_CPP
+      model-path: ${STT_WHISPER_MODEL:${STT_MODEL_DIR:/data/local/tmp/bocbang/models}/whisper-small-en.bin}
+      language: en
+      timeout: 5m
+
+  # Silero VAD — loaded via libbocbang_whisper.so (whisper.cpp)
+  vad:
+    model-path: ${STT_VAD_MODEL:${STT_MODEL_DIR:/data/local/tmp/bocbang/models}/ggml-silero-vad.bin}
+    threshold: 0.5
+    min-speech-duration-ms: 250
+    min-silence-duration-ms: 100
+    speech-pad-ms: 30
+    max-segment-seconds: 30
+    max-merge-gap-seconds: 1.0
+
+  # Transcript cleanup — loaded via libbocbang_llama.so (llama.cpp)
+  refiner:
+    enabled: ${STT_REFINER_ENABLED:true}
+    model-path: ${STT_REFINER_MODEL:${STT_MODEL_DIR:/data/local/tmp/bocbang/models}/qwen3-4b-instruct-2507-q4_k_m.gguf}
+    max-tokens: 2048
+    temperature: 0.1
+    max-batch-chars: 1500
+    timeout: 10m
+
+  # Converts any uploaded audio (mp3, m4a, ogg, wav of any rate/channels) to 16 kHz 16-bit mono WAV.
+  ffmpeg:
+    command:
+      - ${STT_FFMPEG_BIN:ffmpeg}
+      - -nostdin
+      - -hide_banner
+      - -loglevel
+      - error
+      - -y
+      - -i
+      - "{input}"
+      - -vn
+      - -map_metadata
+      - "-1"
+      - -ac
+      - "1"
+      - -ar
+      - "{sample_rate}"
+      - -c:a
+      - pcm_s16le
+      - -f
+      - wav
+      - "{output}"
+    timeout: 15m
+
+  jobs:
+    directory: ${STT_JOBS_DIR:}
+    max-queued: 20
+    result-ttl: 24h

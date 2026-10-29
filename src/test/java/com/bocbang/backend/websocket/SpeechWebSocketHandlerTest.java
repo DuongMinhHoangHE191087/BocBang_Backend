@@ -23,7 +23,7 @@ class SpeechWebSocketHandlerTest {
 
     private final FakeSpeechToTextEngine engine = new FakeSpeechToTextEngine("xin chào");
     private final SpeechWebSocketHandler handler =
-            new SpeechWebSocketHandler(engine, new SttProperties(16000, new SttProperties.Vosk("unused")));
+            new SpeechWebSocketHandler(engine, new SttProperties(16000, 60, 4, null, true, null, null, null, null, null, null));
 
     @Test
     void sendsReadyThenPartialAndFinalTranscripts() throws Exception {
@@ -51,8 +51,8 @@ class SpeechWebSocketHandlerTest {
     }
 
     @Test
-    void rejectsSampleRateOutsideSupportedRange() throws Exception {
-        WebSocketSession webSocket = webSocket("ws://localhost/ws/stt?sampleRate=100");
+    void rejectsSampleRateOtherThanModelRate() throws Exception {
+        WebSocketSession webSocket = webSocket("ws://localhost/ws/stt?sampleRate=8000");
 
         handler.afterConnectionEstablished(webSocket);
 
