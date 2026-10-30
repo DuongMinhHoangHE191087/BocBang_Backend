@@ -238,13 +238,61 @@ class SttEndToEndTest {
     @Test
     void servesTheDemoPageAndExposesMetrics() throws Exception {
         HttpResponse<String> page = get("/");
+        HttpResponse<String> monitor = get("/monitor.html");
         HttpResponse<String> sessions = get("/actuator/metrics/stt.sessions.active");
         HttpResponse<String> workers = get("/actuator/metrics/stt.inference.workers");
 
         assertThat(page.statusCode()).isEqualTo(200);
         assertThat(page.body()).contains("BocBang");
+        assertThat(monitor.statusCode()).isEqualTo(200);
+        assertThat(monitor.body()).contains("BocBang Monitor");
         assertThat(sessions.statusCode()).isEqualTo(200);
         assertThat(workers.body()).contains("\"name\":\"stt.inference.workers\"").contains("\"value\":2.0");
+    }
+
+    @Test
+    void exposesPrometheusHistogramsAndPerStageMetricsAcrossHttpWebSocketAndJobs() throws Exception {
+        assertThat(get("/api/v1/stt/status").statusCode()).isEqualTo(200);
+        assertThat(postWav("/api/v1/stt/transcriptions", wav(new byte[16000 * 2])).statusCode()).isEqualTo(200);
+
+        Client client = connect("/ws/stt?sampleRate=16000");
+        try {
+            client.awaitMessage("\"type\":\"ready\"");
+            client.sendBinary(new byte[3200]);
+            client.sendText("{\"type\":\"end\"}");
+            client.awaitMessage("\"type\":\"final\"");
+        } finally {
+            client.close();
+        }
+
+        HttpResponse<String> submitted = postWav("/api/v1/stt/jobs?refine=false", wav(new byte[16000 * 2]));
+        String jobId = jobId(submitted.body());
+        await().atMost(15, TimeUnit.SECONDS)
+                .until(() -> get("/api/v1/stt/jobs/" + jobId).body().contains("\"status\":\"DONE\""));
+
+        HttpResponse<String> prometheus = get("/actuator/prometheus");
+        assertThat(prometheus.statusCode()).isEqualTo(200);
+        assertThat(prometheus.body())
+                .contains("application=\"bocbang-backend\"")
+                .contains("http_server_requests_seconds_bucket{")
+                .contains("uri=\"/api/v1/stt/transcriptions\"")
+                .contains("le=\"0.1\"")
+                .contains("le=\"+Inf\"")
+                .contains("stt_queue_wait_seconds_count")
+                .contains("stt_inference_duration_seconds_bucket{")
+                .contains("stt_ws_connections_total{")
+                .contains("stt_ws_audio_bytes_total")
+                .contains("stt_ws_utterances_total{")
+                .contains("stt_ws_utterance_lag_seconds_bucket{")
+                .contains("stt_jobs_submitted_total{")
+                .contains("stt_jobs_stage_duration_seconds_count{")
+                .contains("stage=\"CONVERTING\"")
+                .contains("stage=\"DETECTING_SPEECH\"")
+                .contains("stage=\"TRANSCRIBING\"")
+                .contains("stt_jobs_duration_seconds_count{")
+                .contains("stt_native_active")
+                .contains("process_memory_rss_bytes")
+                .contains("system_memory_available_bytes");
     }
 
     private HttpResponse<String> get(String path) throws Exception {

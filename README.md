@@ -114,9 +114,15 @@ Lỗi trả theo RFC 9457 (`application/problem+json`): `400` file sai định d
 | `/actuator/health/liveness` | Liveness probe. Luôn UP khi tiến trình còn sống, không phụ thuộc tải |
 | `/actuator/health/readiness` | Readiness probe. `503` (trạng thái `BUSY`) khi đã đầy slot, để load balancer chuyển người dùng mới sang node khác |
 | `/actuator/health` | Tổng hợp. Node đầy slot vẫn trả `200`, vì đầy là bận chứ không phải hỏng |
-| `/actuator/metrics`, `/actuator/prometheus` | Metrics (Prometheus scrape được) |
+| `/actuator/metrics`, `/actuator/prometheus` | Metrics kèm histogram & phân vị p50/p95/p99 (Prometheus scrape được) |
 
-Metrics riêng: `stt.sessions.active`, `stt.sessions.max`, `stt.sessions.rejected`, `stt.inference.workers`, `stt.inference.active`, `stt.inference.queued`, `stt.inference.duration`, `stt.queue.wait`, `stt.auth.rejected`. Chỉ số cần theo dõi nhất là `stt.queue.wait`: tăng nghĩa là máy đang quá tải.
+Metrics riêng:
+- **Phiên & bộ thread**: `stt.sessions.active`, `stt.sessions.max`, `stt.sessions.rejected`, `stt.inference.workers`, `stt.inference.active`, `stt.inference.queued`, `stt.inference.duration`, `stt.queue.wait`, `stt.auth.rejected`.
+- **WebSocket (`/ws/stt`)**: `stt.ws.connections.active`, `stt.ws.connections`, `stt.ws.audio.bytes`, `stt.ws.utterances`, `stt.ws.utterance.lag`, `stt.ws.errors`.
+- **Job file dài (`/api/v1/stt/jobs`)**: `stt.jobs.active`, `stt.jobs.queued`, `stt.jobs.stored`, `stt.jobs.submitted`, `stt.jobs.stage.duration` (theo từng bước `CONVERTING`, `DETECTING_SPEECH`, `TRANSCRIBING`, `REFINING`), `stt.jobs.duration`, `stt.jobs.segments`, `stt.jobs.audio.seconds`.
+- **Khóa CPU JNI (`CpuExecutionGate`)**: `stt.native.active`, `stt.native.queued`, `stt.native.wait`, `stt.native.duration` (theo `operation` = `vad`, `asr:<model>`, `refiner`).
+
+Chỉ số cần theo dõi nhất là `stt.queue.wait` và `stt.native.wait`: tăng nghĩa là máy đang quá tải.
 
 ### WebSocket: `ws://<host>:8080/ws/stt?sampleRate=16000`
 

@@ -9,6 +9,11 @@ import com.bocbang.backend.stt.SpeechSession;
 import com.bocbang.backend.stt.SpeechToTextEngine;
 import com.bocbang.backend.stt.SttProperties;
 import com.bocbang.backend.stt.TranscriptEvent;
+import io.micrometer.core.instrument.Counter;
+import io.micrometer.core.instrument.Gauge;
+import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.core.instrument.Timer;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.Locale;
@@ -16,9 +21,11 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.TimeUnit;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.DisposableBean;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 import org.springframework.web.socket.BinaryMessage;
 import org.springframework.web.socket.CloseStatus;
@@ -57,15 +64,31 @@ public class SpeechWebSocketHandler extends AbstractWebSocketHandler implements 
     private final RuntimeProperties runtime;
     private final SessionLimiter limiter;
     private final InferenceExecutor executor;
+    private final MeterRegistry meters;
+    private final Counter audioBytesReceived;
     private final Set<Connection> connections = ConcurrentHashMap.newKeySet();
 
     public SpeechWebSocketHandler(SpeechToTextEngine engine, SttProperties properties, RuntimeProperties runtime,
             SessionLimiter limiter, InferenceExecutor executor) {
+        this(engine, properties, runtime, limiter, executor, new SimpleMeterRegistry());
+    }
+
+    @Autowired
+    public SpeechWebSocketHandler(SpeechToTextEngine engine, SttProperties properties, RuntimeProperties runtime,
+            SessionLimiter limiter, InferenceExecutor executor, MeterRegistry meters) {
         this.engine = engine;
         this.properties = properties;
         this.runtime = runtime;
         this.limiter = limiter;
         this.executor = executor;
+        this.meters = meters;
+        Gauge.builder("stt.ws.connections.active", connections, Set::size)
+                .description("Open WebSocket speech connections right now")
+                .register(meters);
+        this.audioBytesReceived = Counter.builder("stt.ws.audio.bytes")
+                .baseUnit("bytes")
+                .description("PCM audio bytes received over WebSocket")
+                .register(meters);
     }
 
     @Override
@@ -74,11 +97,13 @@ public class SpeechWebSocketHandler extends AbstractWebSocketHandler implements 
         try {
             sampleRate = requestedSampleRate(webSocket);
         } catch (IllegalArgumentException e) {
+            recordConnection("rejected", "invalid_sample_rate");
             reject(webSocket, "invalid_sample_rate", e.getMessage(), CloseStatus.POLICY_VIOLATION);
             return;
         }
         Optional<SessionLimiter.Permit> permit = limiter.tryAcquire();
         if (permit.isEmpty()) {
+            recordConnection("rejected", "capacity_exceeded");
             reject(webSocket, "capacity_exceeded", "Server is at capacity, retry shortly", CloseStatus.SERVICE_OVERLOAD);
             return;
         }
@@ -87,6 +112,7 @@ public class SpeechWebSocketHandler extends AbstractWebSocketHandler implements 
             speech = engine.openSession(sampleRate);
         } catch (RuntimeException e) {
             permit.get().close();
+            recordConnection("rejected", "engine_failure");
             LOG.error("Cannot open a {} session", engine.name(), e);
             reject(webSocket, "engine_failure", "Cannot start recognition", CloseStatus.SERVER_ERROR);
             return;
@@ -101,6 +127,7 @@ public class SpeechWebSocketHandler extends AbstractWebSocketHandler implements 
         Connection connection = new Connection(socket, pipeline);
         webSocket.getAttributes().put(CONNECTION_ATTRIBUTE, connection);
         connections.add(connection);
+        recordConnection("accepted", "none");
 
         send(socket, Map.of(
                 "type", "ready",
@@ -123,9 +150,13 @@ public class SpeechWebSocketHandler extends AbstractWebSocketHandler implements 
             sendError(connection.socket(), "invalid_frame", "PCM 16-bit frames must have an even number of bytes");
             return;
         }
-        if (pcm.length > 0 && !connection.pipeline().offer(pcm)) {
-            sendError(connection.socket(), "overloaded", "Server cannot keep up with the audio stream");
-            close(connection.socket(), CloseStatus.SERVICE_OVERLOAD);
+        if (pcm.length > 0) {
+            if (!connection.pipeline().offer(pcm)) {
+                sendError(connection.socket(), "overloaded", "Server cannot keep up with the audio stream");
+                close(connection.socket(), CloseStatus.SERVICE_OVERLOAD);
+            } else {
+                audioBytesReceived.increment(pcm.length);
+            }
         }
     }
 
@@ -174,8 +205,19 @@ public class SpeechWebSocketHandler extends AbstractWebSocketHandler implements 
         return new SessionPipeline.Listener() {
             @Override
             public void onTranscript(TranscriptEvent event, long lagMillis) {
+                String type = event.type().name().toLowerCase(Locale.ROOT);
+                Counter.builder("stt.ws.utterances")
+                        .description("Transcript events delivered over WebSocket")
+                        .tag("type", type)
+                        .register(meters)
+                        .increment();
+                Timer.builder("stt.ws.utterance.lag")
+                        .description("End-to-end wait and inference lag for WebSocket transcripts")
+                        .tag("type", type)
+                        .register(meters)
+                        .record(Math.max(0L, lagMillis), TimeUnit.MILLISECONDS);
                 send(socket, Map.of(
-                        "type", event.type().name().toLowerCase(Locale.ROOT),
+                        "type", type,
                         "text", event.text(),
                         "lagMs", lagMillis));
             }
@@ -203,6 +245,23 @@ public class SpeechWebSocketHandler extends AbstractWebSocketHandler implements 
                 permit.close();
             }
         };
+    }
+
+    private void recordConnection(String outcome, String reason) {
+        Counter.builder("stt.ws.connections")
+                .description("WebSocket connection attempts by outcome")
+                .tag("outcome", outcome)
+                .tag("reason", reason)
+                .register(meters)
+                .increment();
+    }
+
+    private void recordError(String code) {
+        Counter.builder("stt.ws.errors")
+                .description("Error frames sent to WebSocket clients")
+                .tag("code", code)
+                .register(meters)
+                .increment();
     }
 
     private int requestedSampleRate(WebSocketSession webSocket) {
@@ -234,12 +293,13 @@ public class SpeechWebSocketHandler extends AbstractWebSocketHandler implements 
         return webSocket.getAttributes().get(CONNECTION_ATTRIBUTE) instanceof Connection connection ? connection : null;
     }
 
-    private static void reject(WebSocketSession webSocket, String code, String message, CloseStatus status) {
+    private void reject(WebSocketSession webSocket, String code, String message, CloseStatus status) {
         sendError(webSocket, code, message);
         close(webSocket, status);
     }
 
-    private static void sendError(WebSocketSession webSocket, String code, String message) {
+    private void sendError(WebSocketSession webSocket, String code, String message) {
+        recordError(code);
         send(webSocket, Map.of("type", "error", "code", code, "message", message));
     }
 
