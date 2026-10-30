@@ -26,6 +26,19 @@ management:
     web:
       exposure:
         include: health,info,metrics,prometheus
+  metrics:
+    tags:
+      application: ${spring.application.name}
+    distribution:
+      # Explicit latency buckets keep /actuator/prometheus human-readable and light on the board's 512 MB heap.
+      slo:
+        "[http.server.requests]": 10ms, 50ms, 100ms, 250ms, 500ms, 1s, 2s, 5s, 15s, 30s, 60s
+        "[stt]": 10ms, 50ms, 100ms, 250ms, 500ms, 1s, 2s, 5s, 15s, 30s, 60s, 180s, 600s
+  prometheus:
+    metrics:
+      export:
+        enabled: true
+        descriptions: true
   endpoint:
     health:
       probes:

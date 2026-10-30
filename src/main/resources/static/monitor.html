@@ -1,0 +1,231 @@
+<!doctype html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>BocBang Monitor — Giám sát thời gian thực</title>
+  <link rel="stylesheet" href="app.css">
+  <link rel="stylesheet" href="monitor.css">
+</head>
+<body>
+  <header class="top mon-top">
+    <div>
+      <div class="mon-title-row">
+        <h1>BocBang Monitor</h1>
+        <span class="badge" id="healthBadge">ĐANG KẾT NỐI</span>
+      </div>
+      <p class="tagline">Giám sát trực tiếp từ <code>/actuator/prometheus</code> — CPU, RAM native C++, HTTP, WebSocket, Job bóc băng &amp; Khóa CPU JNI.</p>
+    </div>
+
+    <div class="mon-controls">
+      <label class="ctrl-inline">
+        <span>Chu kỳ</span>
+        <select id="pollInterval">
+          <option value="500">0.5s</option>
+          <option value="1000" selected>1.0s</option>
+          <option value="2000">2.0s</option>
+          <option value="5000">5.0s</option>
+          <option value="0">Tạm dừng</option>
+        </select>
+      </label>
+      <label class="ctrl-inline">
+        <span>API Key</span>
+        <input type="password" id="monApiKey" placeholder="Tùy chọn" autocomplete="off" spellcheck="false">
+      </label>
+      <a class="nav-link" href="/">&larr; Trang Demo</a>
+    </div>
+  </header>
+
+  <main class="mon-main">
+    <p class="mon-banner" id="monError" role="alert" hidden></p>
+
+    <section class="kpi-grid" aria-label="Chỉ số hệ thống chính">
+      <article class="card">
+        <div class="card-head">
+          <h2>CPU Máy chủ &amp; Tiến trình</h2>
+          <span class="mono-val" id="cpuSummary">—</span>
+        </div>
+        <div class="sub-metrics">
+          <div><span>Tiến trình (Java+JNI)</span><strong id="procCpu">—</strong></div>
+          <div><span>Toàn hệ thống</span><strong id="sysCpu">—</strong></div>
+          <div><span>Số nhân / Load 1m</span><strong id="cpuCoresLoad">—</strong></div>
+        </div>
+        <canvas id="cpuChart" class="spark" height="84"></canvas>
+        <div class="legend">
+          <span><i class="dot accent"></i>Tiến trình CPU%</span>
+          <span><i class="dot warn"></i>Hệ thống CPU%</span>
+        </div>
+      </article>
+
+      <article class="card">
+        <div class="card-head">
+          <h2>Bộ nhớ RAM (C++ RSS &amp; JVM)</h2>
+          <span class="mono-val" id="memSummary">—</span>
+        </div>
+        <div class="sub-metrics">
+          <div><span>RSS Tiến trình / Đỉnh</span><strong id="procRss">—</strong></div>
+          <div><span>JVM Heap / Non-Heap</span><strong id="jvmMem">—</strong></div>
+          <div><span>RAM Board trống</span><strong id="sysMemAvail">—</strong></div>
+        </div>
+        <canvas id="memChart" class="spark" height="84"></canvas>
+        <div class="legend">
+          <span><i class="dot accent"></i>RSS (Java + GGUF)</span>
+          <span><i class="dot ok"></i>JVM Heap</span>
+        </div>
+      </article>
+
+      <article class="card">
+        <div class="card-head">
+          <h2>Lưu lượng &amp; Tốc độ xử lý</h2>
+          <span class="mono-val" id="rpsSummary">0.0 req/s</span>
+        </div>
+        <div class="sub-metrics">
+          <div><span>HTTP đang xử lý</span><strong id="httpActive">0</strong></div>
+          <div><span>WebSocket mở / PCM</span><strong id="wsSummary">0 / 0 KB/s</strong></div>
+          <div><span>Uptime tiến trình</span><strong id="uptimeVal">—</strong></div>
+        </div>
+        <canvas id="rpsChart" class="spark" height="84"></canvas>
+        <div class="legend">
+          <span><i class="dot accent"></i>HTTP req/s</span>
+          <span><i class="dot warn"></i>WS Audio KB/s</span>
+        </div>
+      </article>
+
+      <article class="card">
+        <div class="card-head">
+          <h2>Sức chứa &amp; Hàng đợi CPU</h2>
+          <span class="mono-val" id="slotSummary">0 / 0 slot</span>
+        </div>
+        <div class="bar-group">
+          <div class="bar-label"><span>Slot nhận dạng (SessionLimiter)</span><strong id="slotText">0 / 0</strong></div>
+          <div class="meter full"><span class="meter-fill" id="slotBar"></span></div>
+
+          <div class="bar-label"><span>Worker suy luận / Đang chờ</span><strong id="workerText">0 / 0 (chờ: 0)</strong></div>
+          <div class="meter full"><span class="meter-fill" id="workerBar"></span></div>
+
+          <div class="bar-label"><span>Khóa CPU JNI (CpuExecutionGate)</span><strong id="gateText">Rảnh (chờ: 0)</strong></div>
+          <div class="meter full"><span class="meter-fill" id="gateBar"></span></div>
+        </div>
+        <div class="mini-counters">
+          <span>Từ chối quá tải: <strong id="rejectedSlots">0</strong></span>
+          <span>Từ chối sai khóa: <strong id="rejectedAuth">0</strong></span>
+          <span>Hàng đợi chờ TB: <strong id="queueWaitAvg">0 ms</strong></span>
+        </div>
+      </article>
+    </section>
+
+    <section class="card models-strip" aria-label="Trạng thái các model C++ JNI trong RAM">
+      <div class="strip-head">
+        <h2>Model C++ JNI trong RAM &amp; Thực thi hiện tại</h2>
+        <span class="note" id="activeNativeOp">CPU JNI: Đang rảnh</span>
+      </div>
+      <div class="model-pills" id="modelPills">
+        <span class="pill idle">Chờ dữ liệu từ /actuator/prometheus...</span>
+      </div>
+    </section>
+
+    <section class="card" aria-label="Bảng theo dõi các cuộc gọi HTTP REST">
+      <div class="card-head">
+        <div>
+          <h2>Tất cả API HTTP Request (<code>http_server_requests_seconds</code>)</h2>
+          <p class="note">Tự động gom theo Method + URI + Status; dòng sáng lên khi vừa có request mới.</p>
+        </div>
+        <label class="ctrl-inline">
+          <input type="checkbox" id="hideActuator" checked>
+          <span>Ẩn cuộc gọi <code>/actuator/*</code> của trang giám sát</span>
+        </label>
+      </div>
+      <div class="table-wrap">
+        <table class="mon-table">
+          <thead>
+            <tr>
+              <th>Method</th>
+              <th>Đường dẫn (URI)</th>
+              <th>Status</th>
+              <th class="num">Tổng</th>
+              <th class="num">Tốc độ</th>
+              <th class="num">Đang chạy</th>
+              <th class="num">TB (ms)</th>
+              <th class="num">Gần nhất</th>
+              <th class="num">~p95</th>
+              <th class="num">Đỉnh (max)</th>
+            </tr>
+          </thead>
+          <tbody id="httpTableBody">
+            <tr><td colspan="10" class="empty">Chưa có dữ liệu...</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <div class="split-grid">
+      <section class="card" aria-label="Chi tiết các bước xử lý Job file dài">
+        <div class="card-head">
+          <div>
+            <h2>Luồng xử lý Job âm thanh dài (<code>/api/v1/stt/jobs</code>)</h2>
+            <p class="note">Theo dõi tiến trình 4 bước: Chuẩn hóa ffmpeg &rarr; Silero VAD &rarr; ASR &rarr; Làm sạch Qwen 4B.</p>
+          </div>
+          <span class="mono-val" id="jobsTopStat">Đang chạy: 0 | Hàng đợi: 0</span>
+        </div>
+        <div class="sub-metrics four">
+          <div><span>Đã nhận / Từ chối</span><strong id="jobsSubmitted">0 / 0</strong></div>
+          <div><span>Hoàn thành / Lỗi / Hủy</span><strong id="jobsOutcomes">0 / 0 / 0</strong></div>
+          <div><span>Tổng âm thanh đã xử lý</span><strong id="jobsAudioSec">0.0s</strong></div>
+          <div><span>Tổng phân đoạn VAD</span><strong id="jobsSegments">0</strong></div>
+        </div>
+        <div class="table-wrap">
+          <table class="mon-table compact">
+            <thead>
+              <tr>
+                <th>Bước xử lý (Stage)</th>
+                <th>Model</th>
+                <th class="num">Số lần</th>
+                <th class="num">Tổng thời gian</th>
+                <th class="num">Trung bình</th>
+                <th class="num">Đỉnh (max)</th>
+              </tr>
+            </thead>
+            <tbody id="jobStageBody">
+              <tr><td colspan="6" class="empty">Chưa có job nào chạy.</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="card" aria-label="Chi tiết WebSocket và lời gọi C++ JNI">
+        <div class="card-head">
+          <div>
+            <h2>WebSocket (<code>/ws/stt</code>) &amp; C++ JNI (<code>CpuExecutionGate</code>)</h2>
+            <p class="note">Độ trễ <code>lagMs</code> của phụ đề trực tiếp và thời gian giữ khóa CPU của từng model C++.</p>
+          </div>
+        </div>
+        <div class="sub-metrics four">
+          <div><span>WS Đang mở / Tổng nhận</span><strong id="wsConnStat">0 / 0</strong></div>
+          <div><span>WS Từ chối / Báo lỗi</span><strong id="wsErrStat">0 / 0</strong></div>
+          <div><span>Câu <code>final</code> / <code>partial</code></span><strong id="wsUttStat">0 / 0</strong></div>
+          <div><span>Độ trễ <code>final</code> TB / ~p95</span><strong id="wsLagStat">—</strong></div>
+        </div>
+        <div class="table-wrap">
+          <table class="mon-table compact">
+            <thead>
+              <tr>
+                <th>Thao tác JNI C++</th>
+                <th>Kết quả</th>
+                <th class="num">Số lần</th>
+                <th class="num">Chờ khóa TB</th>
+                <th class="num">Chạy C++ TB</th>
+                <th class="num">Đỉnh (max)</th>
+              </tr>
+            </thead>
+            <tbody id="nativeTableBody">
+              <tr><td colspan="6" class="empty">Chưa phát sinh lời gọi JNI C++.</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+    </div>
+  </main>
+
+  <script src="monitor.js"></script>
+</body>
+</html>
