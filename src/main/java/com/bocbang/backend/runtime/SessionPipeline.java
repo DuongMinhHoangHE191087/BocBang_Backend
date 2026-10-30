@@ -199,6 +199,7 @@ public final class SessionPipeline {
         if (closing.get() || failed) {
             return;
         }
+        executor.recordQueueWait(System.nanoTime() - finish.enqueuedNanos());
         try {
             TranscriptEvent result = session.finish();
             listener.onTranscript(result, millisSince(finish.enqueuedNanos()));

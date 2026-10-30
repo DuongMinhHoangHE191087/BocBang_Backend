@@ -39,9 +39,15 @@ public class InferenceExecutor implements AutoCloseable {
         this.inference = Timer.builder("stt.inference.duration")
                 .description("Time spent in one engine call")
                 .register(meters);
-        Gauge.builder("stt.inference.workers", () -> workers).register(meters);
-        Gauge.builder("stt.inference.active", pool, ThreadPoolExecutor::getActiveCount).register(meters);
-        Gauge.builder("stt.inference.queued", pool, p -> p.getQueue().size()).register(meters);
+        Gauge.builder("stt.inference.workers", () -> workers)
+                .description("Configured inference worker threads")
+                .register(meters);
+        Gauge.builder("stt.inference.active", pool, ThreadPoolExecutor::getActiveCount)
+                .description("Inference worker threads currently busy")
+                .register(meters);
+        Gauge.builder("stt.inference.queued", pool, p -> p.getQueue().size())
+                .description("Inference tasks waiting for a free worker")
+                .register(meters);
     }
 
     /** Runs the task on an inference thread without waiting. */
@@ -51,7 +57,11 @@ public class InferenceExecutor implements AutoCloseable {
 
     /** Runs the task on an inference thread and waits for its result, rethrowing its failure unchanged. */
     public <T> T call(Callable<T> task) throws Exception {
-        Future<T> future = pool.submit(() -> inference.recordCallable(task));
+        long submittedAt = System.nanoTime();
+        Future<T> future = pool.submit(() -> {
+            recordQueueWait(System.nanoTime() - submittedAt);
+            return inference.recordCallable(task);
+        });
         try {
             return future.get();
         } catch (ExecutionException e) {
@@ -67,7 +77,7 @@ public class InferenceExecutor implements AutoCloseable {
     }
 
     public void recordQueueWait(long nanos) {
-        queueWait.record(nanos, TimeUnit.NANOSECONDS);
+        queueWait.record(Math.max(0L, nanos), TimeUnit.NANOSECONDS);
     }
 
     public int workers() {
