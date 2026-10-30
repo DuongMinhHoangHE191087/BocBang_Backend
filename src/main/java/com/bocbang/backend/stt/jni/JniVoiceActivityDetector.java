@@ -5,6 +5,9 @@ import com.bocbang.backend.stt.SpeechSegment;
 import com.bocbang.backend.stt.SttProperties;
 import com.bocbang.backend.stt.VoiceActivityDetector;
 import com.bocbang.backend.stt.Wav;
+import io.micrometer.core.instrument.Gauge;
+import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -13,6 +16,7 @@ import java.util.ArrayList;
 import java.util.List;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 
 /**
@@ -30,12 +34,22 @@ public class JniVoiceActivityDetector implements VoiceActivityDetector, AutoClos
     private final SttProperties.Vad config;
     private final CpuExecutionGate gate;
 
-    private long vadHandle;
+    private volatile long vadHandle;
 
     public JniVoiceActivityDetector(SttProperties properties, CpuExecutionGate gate) {
+        this(properties, gate, new SimpleMeterRegistry());
+    }
+
+    @Autowired
+    public JniVoiceActivityDetector(SttProperties properties, CpuExecutionGate gate, MeterRegistry meters) {
         this.properties = properties;
         this.config = properties.vad();
         this.gate = gate;
+        Gauge.builder("stt.native.model.loaded", this, v -> v.vadHandle != 0 ? 1.0 : 0.0)
+                .description("Whether this native C++ model is currently resident in memory")
+                .tag("role", "vad")
+                .tag("model", "silero-vad")
+                .register(meters);
     }
 
     @Override
@@ -65,7 +79,7 @@ public class JniVoiceActivityDetector implements VoiceActivityDetector, AutoClos
             double windowEnd = Math.min(duration, windowStart + WINDOW_SECONDS);
             float[] samples = readWindow(wav, info, windowStart, windowEnd);
             double offset = windowStart;
-            double[] bounds = gate.call(Duration.ofMinutes(5), null, () -> {
+            double[] bounds = gate.call("vad", Duration.ofMinutes(5), null, () -> {
                 long handle = ensureLoaded(modelFile);
                 return WhisperNative.vadDetect(
                         handle,
@@ -89,7 +103,7 @@ public class JniVoiceActivityDetector implements VoiceActivityDetector, AutoClos
 
     @Override
     public void close() {
-        gate.call(null, null, () -> {
+        gate.call("vad_unload", null, null, () -> {
             if (vadHandle != 0) {
                 WhisperNative.vadFree(vadHandle);
                 vadHandle = 0;

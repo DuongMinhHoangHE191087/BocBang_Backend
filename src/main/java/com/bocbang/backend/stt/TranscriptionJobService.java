@@ -3,6 +3,11 @@ package com.bocbang.backend.stt;
 import com.bocbang.backend.stt.TranscriptionJob.Segment;
 import com.bocbang.backend.stt.TranscriptionJob.Stage;
 import com.bocbang.backend.stt.TranscriptionJob.Status;
+import io.micrometer.core.instrument.Counter;
+import io.micrometer.core.instrument.Gauge;
+import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.core.instrument.Timer;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.file.Files;
@@ -27,6 +32,7 @@ import java.util.stream.Collectors;
 import java.util.stream.Stream;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 import org.springframework.util.FileSystemUtils;
 
@@ -47,6 +53,8 @@ public class TranscriptionJobService implements AutoCloseable {
     private final VoiceActivityDetector vad;
     private final TranscriptRefiner refiner;
     private final AudioConverter converter;
+    private final MeterRegistry meters;
+    private final Counter audioSecondsProcessed;
     private final Path jobsRoot;
     private final ThreadPoolExecutor executor;
     private final boolean ownsRoot;
@@ -58,11 +66,23 @@ public class TranscriptionJobService implements AutoCloseable {
             VoiceActivityDetector vad,
             TranscriptRefiner refiner,
             AudioConverter converter) throws IOException {
+        this(properties, engine, vad, refiner, converter, new SimpleMeterRegistry());
+    }
+
+    @Autowired
+    public TranscriptionJobService(
+            SttProperties properties,
+            SpeechToTextEngine engine,
+            VoiceActivityDetector vad,
+            TranscriptRefiner refiner,
+            AudioConverter converter,
+            MeterRegistry meters) throws IOException {
         this.properties = properties;
         this.engine = engine;
         this.vad = vad;
         this.refiner = refiner;
         this.converter = converter;
+        this.meters = meters;
         String configuredDir = properties.jobs().directory();
         this.ownsRoot = configuredDir == null || configuredDir.isBlank();
         this.jobsRoot = ownsRoot
@@ -76,18 +96,32 @@ public class TranscriptionJobService implements AutoCloseable {
                 new LinkedBlockingQueue<>(Math.max(1, properties.jobs().maxQueued())),
                 Executors.defaultThreadFactory(),
                 new ThreadPoolExecutor.AbortPolicy());
+        Gauge.builder("stt.jobs.active", executor, ThreadPoolExecutor::getActiveCount)
+                .description("Long-audio transcription jobs currently running")
+                .register(meters);
+        Gauge.builder("stt.jobs.queued", executor, p -> p.getQueue().size())
+                .description("Long-audio transcription jobs waiting in queue")
+                .register(meters);
+        Gauge.builder("stt.jobs.stored", jobs, Map::size)
+                .description("Long-audio jobs currently held in memory")
+                .register(meters);
+        this.audioSecondsProcessed = Counter.builder("stt.jobs.audio.seconds")
+                .baseUnit("seconds")
+                .description("Total audio duration processed by long-audio jobs")
+                .register(meters);
     }
 
     public TranscriptionJob submit(InputStream audio, String originalFilename, String model, Boolean refine)
             throws IOException {
         evictExpired();
         String chosenModel = resolveModel(model);
+        boolean shouldRefine = (refine == null ? properties.refiner().enabled() : refine)
+                && properties.refiner().enabled();
         if (executor.getQueue().remainingCapacity() == 0) {
+            recordSubmitted(chosenModel, shouldRefine, "rejected_queue_full");
             // Known before the upload is copied: a client cannot make the server write 500 MB to refuse it.
             throw new SpeechRecognitionException("Transcription queue is full, try again later");
         }
-        boolean shouldRefine = (refine == null ? properties.refiner().enabled() : refine)
-                && properties.refiner().enabled();
 
         String id = UUID.randomUUID().toString();
         Path jobDir = Files.createDirectories(jobsRoot.resolve(id));
@@ -95,6 +129,7 @@ public class TranscriptionJobService implements AutoCloseable {
         long bytes = Files.copy(audio, uploaded, StandardCopyOption.REPLACE_EXISTING);
         if (bytes == 0) {
             deleteQuietly(jobDir);
+            recordSubmitted(chosenModel, shouldRefine, "invalid");
             throw new IllegalArgumentException("Audio file is empty");
         }
 
@@ -105,8 +140,10 @@ public class TranscriptionJobService implements AutoCloseable {
         } catch (RejectedExecutionException e) {
             jobs.remove(id);
             deleteQuietly(jobDir);
+            recordSubmitted(chosenModel, shouldRefine, "rejected_queue_full");
             throw new SpeechRecognitionException("Transcription queue is full, try again later", e);
         }
+        recordSubmitted(chosenModel, shouldRefine, "accepted");
         return state.snapshot();
     }
 
@@ -128,6 +165,7 @@ public class TranscriptionJobService implements AutoCloseable {
             future.cancel(true);
         }
         deleteQuietly(state.jobDir);
+        recordJobDuration(state, Status.CANCELLED);
         return true;
     }
 
@@ -135,12 +173,15 @@ public class TranscriptionJobService implements AutoCloseable {
         try {
             state.stage(Stage.CONVERTING, 0.02);
             Path normalized = state.jobDir.resolve("normalized.wav");
+            long convertStarted = System.nanoTime();
             try {
                 converter.convert(uploaded, normalized);
             } catch (RuntimeException e) {
                 log.warn("Converting the upload of job {} failed", state.jobId, e);
                 throw new JobFailure("The audio file could not be converted, "
                         + "check that it is a valid audio or video file");
+            } finally {
+                recordStage(Stage.CONVERTING, state.model, System.nanoTime() - convertStarted);
             }
             Files.deleteIfExists(uploaded);
             state.checkCancelled();
@@ -151,24 +192,41 @@ public class TranscriptionJobService implements AutoCloseable {
                         + properties.sampleRate() + " Hz; check stt.ffmpeg.command");
             }
             state.durationSeconds = roundMillis(wavInfo.durationSeconds());
+            audioSecondsProcessed.increment(Math.max(0.0, wavInfo.durationSeconds()));
 
             state.stage(Stage.DETECTING_SPEECH, 0.08);
-            List<SpeechSegment> speech = vad.detect(normalized);
+            long vadStarted = System.nanoTime();
+            List<SpeechSegment> speech;
+            try {
+                speech = vad.detect(normalized);
+            } finally {
+                recordStage(Stage.DETECTING_SPEECH, state.model, System.nanoTime() - vadStarted);
+            }
             state.totalSegments = speech.size();
             state.checkCancelled();
 
             state.stage(Stage.TRANSCRIBING, 0.10);
-            for (int i = 0; i < speech.size(); i++) {
-                state.checkCancelled();
-                SpeechSegment span = speech.get(i);
-                float[] samples = Wav.readFloats(normalized, wavInfo, span.start(), span.end());
-                String piece = engine.transcribe(state.model, samples).trim();
-                if (!piece.isEmpty()) {
-                    state.segments.add(new Segment(
-                            state.segments.size(), roundMillis(span.start()), roundMillis(span.end()), piece));
+            long transcribeStarted = System.nanoTime();
+            Counter segmentCounter = Counter.builder("stt.jobs.segments")
+                    .description("Speech segments transcribed across long-audio jobs")
+                    .tag("model", state.model)
+                    .register(meters);
+            try {
+                for (int i = 0; i < speech.size(); i++) {
+                    state.checkCancelled();
+                    SpeechSegment span = speech.get(i);
+                    float[] samples = Wav.readFloats(normalized, wavInfo, span.start(), span.end());
+                    String piece = engine.transcribe(state.model, samples).trim();
+                    segmentCounter.increment();
+                    if (!piece.isEmpty()) {
+                        state.segments.add(new Segment(
+                                state.segments.size(), roundMillis(span.start()), roundMillis(span.end()), piece));
+                    }
+                    double ratio = (i + 1.0) / speech.size();
+                    state.segmentCompleted(i + 1, 0.10 + 0.80 * ratio);
                 }
-                double ratio = (i + 1.0) / speech.size();
-                state.segmentCompleted(i + 1, 0.10 + 0.80 * ratio);
+            } finally {
+                recordStage(Stage.TRANSCRIBING, state.model, System.nanoTime() - transcribeStarted);
             }
 
             String raw = state.segments.stream()
@@ -182,28 +240,66 @@ public class TranscriptionJobService implements AutoCloseable {
                     engine.releaseModels();
                 }
                 state.stage(Stage.REFINING, 0.92);
+                long refineStarted = System.nanoTime();
                 try {
                     finalText = refineInBatches(state, raw);
                 } finally {
+                    recordStage(Stage.REFINING, state.model, System.nanoTime() - refineStarted);
                     if (properties.unloadBeforeRefine()) {
                         refiner.releaseModel();
                     }
                 }
             }
             state.complete(finalText);
+            recordJobDuration(state, Status.DONE);
         } catch (CancelledException e) {
             state.markCancelled();
+            recordJobDuration(state, Status.CANCELLED);
         } catch (Throwable e) {
             if (state.status == Status.CANCELLED || Thread.currentThread().isInterrupted()) {
                 state.markCancelled();
+                recordJobDuration(state, Status.CANCELLED);
                 return;
             }
             log.warn("Transcription job {} failed", state.jobId, e);
             // The log has the cause; the client gets only messages written for it, never paths or tool output.
             state.fail(e instanceof JobFailure ? e.getMessage() : "Transcription failed, see the server log");
+            recordJobDuration(state, Status.FAILED);
         } finally {
             deleteQuietly(state.jobDir);
         }
+    }
+
+    private void recordSubmitted(String model, boolean refine, String outcome) {
+        Counter.builder("stt.jobs.submitted")
+                .description("Long-audio job submissions by model and outcome")
+                .tag("model", model)
+                .tag("refine", Boolean.toString(refine))
+                .tag("outcome", outcome)
+                .register(meters)
+                .increment();
+    }
+
+    private void recordStage(Stage stage, String model, long nanos) {
+        Timer.builder("stt.jobs.stage.duration")
+                .description("Time spent in one stage of a long-audio transcription job")
+                .tag("stage", stage.name())
+                .tag("model", model)
+                .register(meters)
+                .record(Math.max(0L, nanos), TimeUnit.NANOSECONDS);
+    }
+
+    private void recordJobDuration(JobState state, Status terminalStatus) {
+        if (!state.durationRecorded.compareAndSet(false, true)) {
+            return;
+        }
+        Timer.builder("stt.jobs.duration")
+                .description("End-to-end wall-clock time of a long-audio job from submission to completion")
+                .tag("model", state.model)
+                .tag("refine", Boolean.toString(state.refine))
+                .tag("status", terminalStatus.name())
+                .register(meters)
+                .record(Math.max(0L, System.nanoTime() - state.submittedNanos), TimeUnit.NANOSECONDS);
     }
 
     private String refineInBatches(JobState state, String raw) {
@@ -325,6 +421,9 @@ public class TranscriptionJobService implements AutoCloseable {
         final boolean refine;
         final Path jobDir;
         final Instant createdAt = Instant.now();
+        final long submittedNanos = System.nanoTime();
+        final java.util.concurrent.atomic.AtomicBoolean durationRecorded =
+                new java.util.concurrent.atomic.AtomicBoolean();
         final List<Segment> segments = new CopyOnWriteArrayList<>();
 
         volatile Future<?> future;

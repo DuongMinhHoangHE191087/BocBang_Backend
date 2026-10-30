@@ -3,11 +3,15 @@ package com.bocbang.backend.stt.jni;
 import com.bocbang.backend.stt.SpeechRecognitionException;
 import com.bocbang.backend.stt.SttProperties;
 import com.bocbang.backend.stt.TranscriptRefiner;
+import io.micrometer.core.instrument.Gauge;
+import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.regex.Pattern;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 
 /**
@@ -35,9 +39,14 @@ public class JniTranscriptRefiner implements TranscriptRefiner, AutoCloseable {
     private final CpuExecutionGate gate;
     private final String promptTemplate;
 
-    private long llamaHandle;
+    private volatile long llamaHandle;
 
     public JniTranscriptRefiner(SttProperties properties, CpuExecutionGate gate) {
+        this(properties, gate, new SimpleMeterRegistry());
+    }
+
+    @Autowired
+    public JniTranscriptRefiner(SttProperties properties, CpuExecutionGate gate, MeterRegistry meters) {
         this.properties = properties;
         this.config = properties.refiner();
         this.gate = gate;
@@ -47,6 +56,11 @@ public class JniTranscriptRefiner implements TranscriptRefiner, AutoCloseable {
         if (!promptTemplate.contains(TEXT_PLACEHOLDER)) {
             throw new IllegalStateException("stt.refiner.prompt must contain " + TEXT_PLACEHOLDER);
         }
+        Gauge.builder("stt.native.model.loaded", this, r -> r.llamaHandle != 0 ? 1.0 : 0.0)
+                .description("Whether this native C++ model is currently resident in memory")
+                .tag("role", "refiner")
+                .tag("model", "qwen3-4b")
+                .register(meters);
     }
 
     @Override
@@ -64,7 +78,7 @@ public class JniTranscriptRefiner implements TranscriptRefiner, AutoCloseable {
         }
         String prompt = promptTemplate.replace(TEXT_PLACEHOLDER, transcript);
         try {
-            String output = gate.call(config.timeout(), this::abortActive, () -> {
+            String output = gate.call("refiner", config.timeout(), this::abortActive, () -> {
                 long handle = ensureLoaded(modelFile);
                 return LlamaNative.generate(
                         handle,
@@ -86,7 +100,7 @@ public class JniTranscriptRefiner implements TranscriptRefiner, AutoCloseable {
 
     @Override
     public void releaseModel() {
-        gate.call(null, null, () -> {
+        gate.call("refiner_unload", null, null, () -> {
             if (llamaHandle != 0) {
                 log.info("Unloading Qwen refiner model");
                 LlamaNative.free(llamaHandle);

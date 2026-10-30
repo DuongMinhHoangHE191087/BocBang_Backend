@@ -5,6 +5,9 @@ import com.bocbang.backend.stt.SpeechSession;
 import com.bocbang.backend.stt.SpeechToTextEngine;
 import com.bocbang.backend.stt.SttProperties;
 import com.bocbang.backend.stt.SttProperties.Backend;
+import io.micrometer.core.instrument.Gauge;
+import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.LinkedHashMap;
@@ -12,6 +15,7 @@ import java.util.List;
 import java.util.Map;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.stereotype.Component;
 
@@ -31,11 +35,16 @@ public class JniSpeechEngine implements SpeechToTextEngine, AutoCloseable {
     private final Map<String, SttProperties.Model> models;
     private final String defaultModel;
 
-    private String loadedModelName;
+    private volatile String loadedModelName;
     private SttProperties.Model loadedConfig;
-    private long nativeHandle;
+    private volatile long nativeHandle;
 
     public JniSpeechEngine(SttProperties properties, CpuExecutionGate gate) {
+        this(properties, gate, new SimpleMeterRegistry());
+    }
+
+    @Autowired
+    public JniSpeechEngine(SttProperties properties, CpuExecutionGate gate, MeterRegistry meters) {
         this.properties = properties;
         this.gate = gate;
         if (properties.models() == null || properties.models().isEmpty()) {
@@ -50,6 +59,14 @@ public class JniSpeechEngine implements SpeechToTextEngine, AutoCloseable {
         });
         this.models = Map.copyOf(copy);
         this.defaultModel = selectDefault(properties.defaultModel(), this.models);
+        this.models.forEach((name, cfg) -> Gauge.builder(
+                        "stt.native.model.loaded",
+                        this,
+                        e -> name.equals(e.loadedModelName) && e.nativeHandle != 0 ? 1.0 : 0.0)
+                .description("Whether this native C++ model is currently resident in memory")
+                .tag("role", "asr")
+                .tag("model", name)
+                .register(meters));
     }
 
     @Override
@@ -86,7 +103,7 @@ public class JniSpeechEngine implements SpeechToTextEngine, AutoCloseable {
         if (samples == null || samples.length == 0) {
             return "";
         }
-        return gate.call(cfg.timeout(), () -> abortActive(cfg.backend()), () -> {
+        return gate.call("asr:" + key, cfg.timeout(), () -> abortActive(cfg.backend()), () -> {
             long handle = ensureLoaded(key, cfg);
             String raw = switch (cfg.backend()) {
                 case TRANSCRIBE_CPP -> TranscribeNative.transcribe(
@@ -100,7 +117,7 @@ public class JniSpeechEngine implements SpeechToTextEngine, AutoCloseable {
 
     @Override
     public void releaseModels() {
-        gate.call(null, null, () -> {
+        gate.call("asr_unload", null, null, () -> {
             unloadCurrent();
             return null;
         });
@@ -131,8 +148,8 @@ public class JniSpeechEngine implements SpeechToTextEngine, AutoCloseable {
                 yield WhisperNative.whisperInit(file.toAbsolutePath().toString());
             }
         };
-        this.loadedModelName = name;
         this.loadedConfig = cfg;
+        this.loadedModelName = name;
         this.nativeHandle = handle;
         return handle;
     }
