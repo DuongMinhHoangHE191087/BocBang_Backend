@@ -1,5 +1,6 @@
 #include <jni.h>
 
+#include <algorithm>
 #include <atomic>
 #include <string>
 #include <vector>
@@ -12,11 +13,13 @@ namespace {
 struct WhisperHandle {
     whisper_context* ctx = nullptr;
     std::atomic<bool> abort{false};
+    std::vector<float> pcmScratch;
 };
 
 struct VadHandle {
     whisper_vad_context* ctx = nullptr;
     int threads = 4;
+    std::vector<float> pcmScratch;
 };
 
 bool onWhisperAbort(void* userData) {
@@ -35,6 +38,7 @@ Java_com_bocbang_backend_stt_jni_WhisperNative_whisperInit(
     std::string path = bocbang::toUtf8(env, modelPath);
     whisper_context_params cparams = whisper_context_default_params();
     cparams.use_gpu = false;
+    cparams.flash_attn = true;
     whisper_context* ctx = whisper_init_from_file_with_params(path.c_str(), cparams);
     if (ctx == nullptr) {
         bocbang::throwRecognitionException(env, "whisper.cpp failed to load model: " + path);
@@ -67,8 +71,7 @@ Java_com_bocbang_backend_stt_jni_WhisperNative_whisperTranscribe(
     if (n <= 0) {
         return bocbang::toJString(env, "");
     }
-    std::vector<float> samples(static_cast<size_t>(n));
-    env->GetFloatArrayRegion(pcm, 0, n, samples.data());
+    const float* samples = bocbang::copyFloatArray(env, pcm, n, handle->pcmScratch);
 
     std::string lang = bocbang::toUtf8(env, language);
     whisper_full_params wparams = whisper_full_default_params(WHISPER_SAMPLING_GREEDY);
@@ -78,12 +81,20 @@ Java_com_bocbang_backend_stt_jni_WhisperNative_whisperTranscribe(
     wparams.print_special = false;
     wparams.print_timestamps = false;
     wparams.no_timestamps = true;
-    wparams.single_segment = false;
+    wparams.no_context = true;
+    wparams.single_segment = n <= 30 * WHISPER_SAMPLE_RATE;
+    // Disable temperature fallback retries (default retries up to 6x on noisy clips).
+    wparams.temperature_inc = 0.0f;
+    // Scale encoder audio_ctx to clip duration (1500 frames = 30 s @ 16 kHz => 320 samples/frame),
+    // 64-frame aligned so short utterances do not run self-attention over 25+ seconds of zero padding.
+    const int neededFrames = (static_cast<int>(n) + 319) / 320 + 64;
+    const int alignedFrames = (neededFrames + 63) & ~63;
+    wparams.audio_ctx = std::min(1500, std::max(128, alignedFrames));
     wparams.language = lang.empty() ? "en" : lang.c_str();
     wparams.abort_callback = onWhisperAbort;
     wparams.abort_callback_user_data = handle;
 
-    int rc = whisper_full(handle->ctx, wparams, samples.data(), n);
+    int rc = whisper_full(handle->ctx, wparams, samples, n);
     if (handle->abort.load(std::memory_order_relaxed)) {
         bocbang::throwRecognitionException(env, "ABORTED");
         return nullptr;
@@ -147,8 +158,7 @@ Java_com_bocbang_backend_stt_jni_WhisperNative_vadDetect(
     if (n <= 0) {
         return env->NewDoubleArray(0);
     }
-    std::vector<float> samples(static_cast<size_t>(n));
-    env->GetFloatArrayRegion(pcm, 0, n, samples.data());
+    const float* samples = bocbang::copyFloatArray(env, pcm, n, handle->pcmScratch);
 
     whisper_vad_params params = whisper_vad_default_params();
     params.threshold = threshold;
@@ -158,7 +168,7 @@ Java_com_bocbang_backend_stt_jni_WhisperNative_vadDetect(
     params.speech_pad_ms = speechPadMs;
 
     whisper_vad_segments* segments = whisper_vad_segments_from_samples(
-            handle->ctx, params, samples.data(), n);
+            handle->ctx, params, samples, n);
     if (segments == nullptr) {
         bocbang::throwRecognitionException(env, "whisper_vad_segments_from_samples failed");
         return nullptr;

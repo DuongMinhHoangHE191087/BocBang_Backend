@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <atomic>
 #include <string>
+#include <thread>
+#include <utility>
 #include <vector>
 
 #include "jni_common.h"
@@ -12,7 +14,36 @@ namespace {
 
 struct LlamaHandle {
     llama_model* model = nullptr;
+    llama_context* ctx = nullptr;
+    llama_batch_ext* batch = nullptr;
+    uint32_t ctxCap = 0;
+    uint32_t batchCap = 0;
+    std::vector<llama_token> kvTokens;
     std::atomic<bool> abort{false};
+
+    void resetContext() {
+        if (batch != nullptr) {
+            llama_batch_ext_free(batch);
+            batch = nullptr;
+        }
+        if (ctx != nullptr) {
+            llama_free(ctx);
+            ctx = nullptr;
+        }
+        ctxCap = 0;
+        batchCap = 0;
+        kvTokens.clear();
+    }
+
+    void invalidateKvCache() {
+        if (ctx != nullptr) {
+            llama_memory_t mem = llama_get_memory(ctx);
+            if (mem != nullptr) {
+                llama_memory_clear(mem, false);
+            }
+        }
+        kvTokens.clear();
+    }
 };
 
 bool onLlamaAbort(void* userData) {
@@ -32,6 +63,14 @@ void setBatchTokens(llama_batch_ext* batch, const llama_token* tokens, int32_t n
     llama_batch_ext_set_output_logits(batch, nTokens - 1, true);
 }
 
+int chooseBatchThreads(int decodeThreads) {
+    const unsigned int hw = std::thread::hardware_concurrency();
+    const int maxHw = hw > 0 ? static_cast<int>(hw) : 8;
+    // Prefill is compute-bound GEMM and scales onto extra LITTLE cores (e.g. 6 of 8 on G520),
+    // while single-token decode stays on decodeThreads to avoid barrier straggler overhead.
+    return std::min(maxHw, std::max(decodeThreads, 6));
+}
+
 }  // namespace
 
 extern "C" JNIEXPORT jlong JNICALL
@@ -43,6 +82,7 @@ Java_com_bocbang_backend_stt_jni_LlamaNative_init(
     std::string path = bocbang::toUtf8(env, modelPath);
     llama_model_params mparams = llama_model_default_params();
     mparams.n_gpu_layers = 0;
+    mparams.use_extra_bufts = true;
 
     llama_model* model = llama_model_load_from_file(path.c_str(), mparams);
     if (model == nullptr) {
@@ -92,22 +132,68 @@ Java_com_bocbang_backend_stt_jni_LlamaNative_generate(
         return nullptr;
     }
 
-    const int nPredict = maxTokens > 0 ? maxTokens : 1024;
+    // Transcript cleanup output length tracks input length closely; capping prevents oversized KV
+    // allocations and runaway generation loops while respecting explicit caller limits.
+    const int callerCap = maxTokens > 0 ? maxTokens : 1024;
+    const int nPredict = std::min(callerCap, std::max(256, nPrompt * 2));
     const int nThreads = threads > 0 ? threads : 4;
+    const int nThreadsBatch = chooseBatchThreads(nThreads);
 
-    llama_context_params cparams = llama_context_default_params();
-    cparams.n_ctx = static_cast<uint32_t>(std::max(2048, nPrompt + nPredict + 32));
-    cparams.n_batch = static_cast<uint32_t>(std::max(512, nPrompt));
-    cparams.n_threads = nThreads;
-    cparams.n_threads_batch = nThreads;
-    cparams.abort_callback = onLlamaAbort;
-    cparams.abort_callback_data = handle;
+    const uint32_t neededCtx = static_cast<uint32_t>(std::max(2048, nPrompt + nPredict + 32));
+    const uint32_t neededBatch = static_cast<uint32_t>(std::max(1024, nPrompt));
 
-    llama_context* ctx = llama_init_from_model(handle->model, cparams);
-    if (ctx == nullptr) {
-        bocbang::throwRecognitionException(env, "Failed to create llama_context");
-        return nullptr;
+    if (handle->ctx == nullptr || neededCtx > handle->ctxCap || neededBatch > handle->batchCap) {
+        handle->resetContext();
+
+        llama_context_params cparams = llama_context_default_params();
+        cparams.n_ctx = neededCtx;
+        cparams.n_batch = neededBatch;
+        cparams.n_ubatch = std::min(neededBatch, 512u);
+        cparams.n_threads = nThreads;
+        cparams.n_threads_batch = nThreadsBatch;
+        cparams.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+        cparams.type_k = GGML_TYPE_F16;
+        cparams.type_v = GGML_TYPE_F16;
+        cparams.no_perf = true;
+        cparams.abort_callback = onLlamaAbort;
+        cparams.abort_callback_data = handle;
+
+        handle->ctx = llama_init_from_model(handle->model, cparams);
+        if (handle->ctx == nullptr) {
+            bocbang::throwRecognitionException(env, "Failed to create llama_context");
+            return nullptr;
+        }
+        handle->batch = llama_batch_ext_init(handle->ctx);
+        if (handle->batch == nullptr) {
+            handle->resetContext();
+            bocbang::throwRecognitionException(env, "Failed to create llama_batch_ext");
+            return nullptr;
+        }
+        handle->ctxCap = neededCtx;
+        handle->batchCap = neededBatch;
+    } else {
+        llama_set_n_threads(handle->ctx, nThreads, nThreadsBatch);
     }
+
+    // Reuse KV cache entries for the shared system-prompt prefix across consecutive batches,
+    // keeping at least the last prompt token so llama_process computes fresh output logits.
+    size_t commonLen = 0;
+    const size_t maxPrefix = static_cast<size_t>(nPrompt - 1);
+    while (commonLen < handle->kvTokens.size()
+            && commonLen < maxPrefix
+            && handle->kvTokens[commonLen] == promptTokens[commonLen]) {
+        ++commonLen;
+    }
+    llama_memory_t mem = llama_get_memory(handle->ctx);
+    if (mem != nullptr) {
+        if (!llama_memory_seq_rm(mem, 0, static_cast<llama_pos>(commonLen), -1)) {
+            llama_memory_clear(mem, false);
+            commonLen = 0;
+        }
+    } else {
+        commonLen = 0;
+    }
+    handle->kvTokens.resize(commonLen);
 
     llama_sampler* sampler = llama_sampler_chain_init(llama_sampler_chain_default_params());
     if (temp <= 0.0f) {
@@ -117,30 +203,39 @@ Java_com_bocbang_backend_stt_jni_LlamaNative_generate(
         llama_sampler_chain_add(sampler, llama_sampler_init_dist(LLAMA_DEFAULT_SEED));
     }
 
-    llama_batch_ext* batch = llama_batch_ext_init(ctx);
-    setBatchTokens(batch, promptTokens.data(), nPrompt, 0);
+    const int32_t prefillCount = nPrompt - static_cast<int32_t>(commonLen);
+    setBatchTokens(handle->batch,
+            promptTokens.data() + commonLen,
+            prefillCount,
+            static_cast<llama_pos>(commonLen));
 
     std::string output;
-    int nTokens = nPrompt;
-    for (int pos = 0; pos + nTokens < nPrompt + nPredict; ) {
-        int rc = llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch);
+    output.reserve(static_cast<size_t>(nPrompt) * 4);
+    bool prefilled = false;
+    int nTokens = prefillCount;
+    for (int pos = static_cast<int>(commonLen); pos + nTokens < nPrompt + nPredict; ) {
+        int rc = llama_process(handle->ctx, LLAMA_PROCESS_TYPE_DECODE, handle->batch);
         if (handle->abort.load(std::memory_order_relaxed)) {
-            llama_batch_ext_free(batch);
             llama_sampler_free(sampler);
-            llama_free(ctx);
+            handle->invalidateKvCache();
             bocbang::throwRecognitionException(env, "ABORTED");
             return nullptr;
         }
         if (rc != 0) {
-            llama_batch_ext_free(batch);
             llama_sampler_free(sampler);
-            llama_free(ctx);
+            handle->invalidateKvCache();
             bocbang::throwRecognitionException(env, "llama_process failed with code " + std::to_string(rc));
             return nullptr;
         }
+        if (!prefilled) {
+            handle->kvTokens.insert(handle->kvTokens.end(),
+                    promptTokens.begin() + static_cast<std::ptrdiff_t>(commonLen),
+                    promptTokens.end());
+            prefilled = true;
+        }
         pos += nTokens;
 
-        llama_token next = llama_sampler_sample(sampler, ctx, -1);
+        llama_token next = llama_sampler_sample(sampler, handle->ctx, -1);
         if (llama_vocab_is_eog(vocab, next)) {
             break;
         }
@@ -150,13 +245,12 @@ Java_com_bocbang_backend_stt_jni_LlamaNative_generate(
             output.append(piece, static_cast<size_t>(pieceLen));
         }
 
-        setBatchTokens(batch, &next, 1, pos);
+        handle->kvTokens.push_back(next);
+        setBatchTokens(handle->batch, &next, 1, pos);
         nTokens = 1;
     }
 
-    llama_batch_ext_free(batch);
     llama_sampler_free(sampler);
-    llama_free(ctx);
     return bocbang::toJString(env, output);
 }
 
@@ -165,6 +259,7 @@ Java_com_bocbang_backend_stt_jni_LlamaNative_free(
         JNIEnv*, jclass, jlong ptr) {
     if (ptr != 0) {
         auto* handle = reinterpret_cast<LlamaHandle*>(ptr);
+        handle->resetContext();
         llama_model_free(handle->model);
         delete handle;
     }

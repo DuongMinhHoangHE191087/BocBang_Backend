@@ -3,6 +3,7 @@
 #include <jni.h>
 #include <cstdio>
 #include <string>
+#include <vector>
 
 #if defined(__ANDROID__)
 #include <android/log.h>
@@ -30,6 +31,22 @@ inline std::string toUtf8(JNIEnv* env, jstring str) {
 
 inline jstring toJString(JNIEnv* env, const std::string& utf8) {
     return env->NewStringUTF(utf8.c_str());
+}
+
+/**
+ * Copies a Java float[] into a reusable native buffer without re-allocating or zero-filling on
+ * every call (a 5-minute 16 kHz VAD window is 19.2 MB). Avoids GetPrimitiveArrayCritical so the
+ * JVM GC is never pinned while a long C++ ggml graph runs.
+ */
+inline const float* copyFloatArray(JNIEnv* env, jfloatArray arr, jsize len, std::vector<float>& scratch) {
+    if (len <= 0) {
+        return nullptr;
+    }
+    if (static_cast<size_t>(len) > scratch.size()) {
+        scratch.resize(static_cast<size_t>(len));
+    }
+    env->GetFloatArrayRegion(arr, 0, len, scratch.data());
+    return scratch.data();
 }
 
 inline void throwRecognitionException(JNIEnv* env, const std::string& message) {

@@ -23,7 +23,8 @@ if(NOT ANDROID)
     include_directories(${JNI_INCLUDE_DIRS})
 endif()
 
-# CPU tuning: ARMv8.2-A + dotprod + fp16 for MediaTek Genio 520 / 720 (Cortex-A78 + Cortex-A55).
+# CPU tuning: ARMv8.2-A + dotprod + fp16 + ARM KleidiAI microkernels for MediaTek Genio 520 / 720
+# (2x Cortex-A78 + 6x Cortex-A55), or native SIMD (AVX2/FMA) on x86_64 host builds.
 set(GGML_OPENMP OFF CACHE BOOL "" FORCE)
 set(GGML_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(GGML_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
@@ -33,9 +34,19 @@ set(GGML_METAL OFF CACHE BOOL "" FORCE)
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64|ARM64")
     set(GGML_NATIVE OFF CACHE BOOL "" FORCE)
     set(GGML_CPU_ARM_ARCH "armv8.2-a+dotprod+fp16" CACHE STRING "" FORCE)
+    set(GGML_CPU_KLEIDIAI ON CACHE BOOL "" FORCE)
+else()
+    set(GGML_NATIVE ON CACHE BOOL "" FORCE)
 endif()
 
 set(VERSION_SCRIPT "${CMAKE_CURRENT_SOURCE_DIR}/exports.map")
+set(COMMON_COMPILE_FLAGS
+    -O3
+    -DNDEBUG
+    -fvisibility=hidden
+    -ffunction-sections
+    -fdata-sections
+    -fno-math-errno)
 set(COMMON_LINK_FLAGS
     "-Wl,--version-script=${VERSION_SCRIPT}"
     "-Wl,-Bsymbolic"
@@ -57,7 +68,7 @@ if(BOCBANG_JNI_MODULE STREQUAL "transcribe")
     if(ANDROID)
         target_link_libraries(bocbang_transcribe PRIVATE log)
     endif()
-    target_compile_options(bocbang_transcribe PRIVATE -O3 -fvisibility=hidden)
+    target_compile_options(bocbang_transcribe PRIVATE ${COMMON_COMPILE_FLAGS})
     target_link_options(bocbang_transcribe PRIVATE ${COMMON_LINK_FLAGS})
 
 elseif(BOCBANG_JNI_MODULE STREQUAL "whisper")
@@ -75,7 +86,7 @@ elseif(BOCBANG_JNI_MODULE STREQUAL "whisper")
     if(ANDROID)
         target_link_libraries(bocbang_whisper PRIVATE log)
     endif()
-    target_compile_options(bocbang_whisper PRIVATE -O3 -fvisibility=hidden)
+    target_compile_options(bocbang_whisper PRIVATE ${COMMON_COMPILE_FLAGS})
     target_link_options(bocbang_whisper PRIVATE ${COMMON_LINK_FLAGS})
 
 elseif(BOCBANG_JNI_MODULE STREQUAL "llama")
@@ -95,7 +106,7 @@ elseif(BOCBANG_JNI_MODULE STREQUAL "llama")
     if(ANDROID)
         target_link_libraries(bocbang_llama PRIVATE log)
     endif()
-    target_compile_options(bocbang_llama PRIVATE -O3 -fvisibility=hidden)
+    target_compile_options(bocbang_llama PRIVATE ${COMMON_COMPILE_FLAGS})
     target_link_options(bocbang_llama PRIVATE ${COMMON_LINK_FLAGS})
 
 else()
