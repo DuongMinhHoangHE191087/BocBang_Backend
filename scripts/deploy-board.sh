@@ -2,11 +2,13 @@
 # Headless ADB deployment for MediaTek G520 Android (userdebug) board — NO screen & NO board internet required.
 #
 # Bundles a self-contained ARM64 Linux chroot (Ubuntu Base 26.04 + OpenJDK 17 JRE + static ffmpeg)
-# on your PC, pushes the Spring Boot fat JAR + JNI .so libraries + models via USB adb, and generates run.sh.
+# on your PC, pushes the Spring Boot fat JAR + KleidiAI-optimized JNI .so libraries + models via USB adb,
+# and generates run.sh / start-bg.sh.
 #
 # Usage:
 #   PUSH_MODELS=/workspace/MeetingNotes-models ./scripts/deploy-board.sh
 #   ./scripts/deploy-board.sh                  # code/JNI update only (keeps existing models & rootfs)
+#   PREPARE_ONLY=1 ./scripts/deploy-board.sh   # build JNI + JAR + cache ARM64 runtime locally without adb
 
 set -euo pipefail
 
@@ -19,15 +21,26 @@ UBUNTU_BASE_URL="https://cdimage.ubuntu.com/ubuntu-base/releases/26.04/release/u
 JRE_URL="https://api.adoptium.net/v3/binary/latest/17/ga/linux/aarch64/jre/hotspot/normal/eclipse"
 FFMPEG_URL="https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linuxarm64-gpl.tar.xz"
 
+needs_native_rebuild() {
+    local marker="${ROOT_DIR}/native/dist/${TARGET}/libbocbang_llama.so"
+    [[ "${FORCE_NATIVE_BUILD:-0}" == "1" ]] && return 0
+    [[ ! -f "${marker}" ]] && return 0
+    local src
+    for src in "${ROOT_DIR}/native/CMakeLists.txt" "${ROOT_DIR}/native"/*.cpp "${ROOT_DIR}/native"/*.h; do
+        [[ -f "${src}" && "${src}" -nt "${marker}" ]] && return 0
+    done
+    return 1
+}
+
 echo "=== 1. Ensuring JNI libraries (${TARGET}) ==="
-if [[ "${FORCE_NATIVE_BUILD:-0}" == "1" ]] || [[ ! -f "${ROOT_DIR}/native/dist/${TARGET}/libbocbang_llama.so" ]]; then
+if needs_native_rebuild; then
     "${ROOT_DIR}/scripts/build-native.sh" "${TARGET}"
 else
-    echo "Using existing ${ROOT_DIR}/native/dist/${TARGET}/*.so (set FORCE_NATIVE_BUILD=1 to rebuild)"
+    echo "Using up-to-date ${ROOT_DIR}/native/dist/${TARGET}/*.so (set FORCE_NATIVE_BUILD=1 to rebuild)"
 fi
 
 echo "=== 2. Building Spring Boot fat JAR ==="
-"${ROOT_DIR}/gradlew" -p "${ROOT_DIR}" bootJar --console=plain
+"${ROOT_DIR}/gradlew" -p "${ROOT_DIR}" bootJar --no-daemon --console=plain
 "${ROOT_DIR}/gradlew" -p "${ROOT_DIR}" --stop >/dev/null 2>&1 || true
 JAR_FILE="$(ls "${ROOT_DIR}"/build/libs/*-SNAPSHOT.jar | head -n 1)"
 
@@ -48,6 +61,11 @@ if [[ ! -f "${CACHE_DIR}/ffmpeg-arm64" ]]; then
     mv "${CACHE_DIR}/ffmpeg" "${CACHE_DIR}/ffmpeg-arm64"
     chmod 755 "${CACHE_DIR}/ffmpeg-arm64"
     rm -f "${CACHE_DIR}/ffmpeg-arm64.tar.xz"
+fi
+
+if [[ "${PREPARE_ONLY:-0}" == "1" ]]; then
+    echo "=== PREPARE_ONLY=1 complete: JNI (${TARGET}), bootJar, and offline ARM64 cache are ready ==="
+    exit 0
 fi
 
 echo "=== 4. Switching adb to root (headless userdebug board) ==="
@@ -130,6 +148,15 @@ fi
 # Protect the server process from Android lmkd / OOM killer during 2.5 GB LLM loads
 echo -900 > /proc/$$/oom_score_adj 2>/dev/null || true
 
+# Bring all MediaTek G520 CPU cores online (2x Cortex-A78 + 6x Cortex-A55) & apply governor.
+for cpu_online in /sys/devices/system/cpu/cpu[0-9]*/online; do
+    [ -w "${cpu_online}" ] && echo 1 > "${cpu_online}" 2>/dev/null || true
+done
+GOV="${CPU_GOVERNOR:-schedutil}"
+for gov_file in /sys/devices/system/cpu/cpufreq/policy*/scaling_governor; do
+    [ -w "${gov_file}" ] && echo "${GOV}" > "${gov_file}" 2>/dev/null || true
+done
+
 mountpoint -q "${ROOTFS}/proc"   || mount -t proc proc "${ROOTFS}/proc"
 mountpoint -q "${ROOTFS}/sys"    || mount --bind /sys "${ROOTFS}/sys"
 mountpoint -q "${ROOTFS}/dev"    || mount --bind /dev "${ROOTFS}/dev"
@@ -147,6 +174,7 @@ export STT_MODEL_DIR="/models"
 export STT_JOBS_DIR="/jobs"
 export STT_FFMPEG_BIN="/usr/local/bin/ffmpeg"
 export STT_THREADS="${STT_THREADS:-4}"
+export STT_ASR_BATCH_SIZE="${STT_ASR_BATCH_SIZE:-4}"
 export STT_UNLOAD_BEFORE_REFINE="${STT_UNLOAD_BEFORE_REFINE:-true}"
 
 exec /system/bin/chroot "${ROOTFS}" /opt/jre/bin/java \

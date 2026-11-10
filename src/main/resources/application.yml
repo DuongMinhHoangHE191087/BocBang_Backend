@@ -149,3 +149,4 @@ stt:
     directory: ${STT_JOBS_DIR:}
     max-queued: 20
     result-ttl: 24h
+    batch-size: ${STT_ASR_BATCH_SIZE:4}

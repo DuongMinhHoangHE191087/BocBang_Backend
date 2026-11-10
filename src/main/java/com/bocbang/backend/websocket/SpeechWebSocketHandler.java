@@ -66,6 +66,9 @@ public class SpeechWebSocketHandler extends AbstractWebSocketHandler implements 
     private final InferenceExecutor executor;
     private final MeterRegistry meters;
     private final Counter audioBytesReceived;
+    private final Map<String, Counter> utteranceCounters = new ConcurrentHashMap<>();
+    private final Map<String, Timer> utteranceLagTimers = new ConcurrentHashMap<>();
+    private final Map<String, Counter> errorCounters = new ConcurrentHashMap<>();
     private final Set<Connection> connections = ConcurrentHashMap.newKeySet();
 
     public SpeechWebSocketHandler(SpeechToTextEngine engine, SttProperties properties, RuntimeProperties runtime,
@@ -144,18 +147,19 @@ public class SpeechWebSocketHandler extends AbstractWebSocketHandler implements 
             return;
         }
         ByteBuffer payload = message.getPayload();
-        byte[] pcm = new byte[payload.remaining()];
-        payload.get(pcm);
-        if (pcm.length % BYTES_PER_SAMPLE != 0) {
+        int len = payload.remaining();
+        if (len % BYTES_PER_SAMPLE != 0) {
             sendError(connection.socket(), "invalid_frame", "PCM 16-bit frames must have an even number of bytes");
             return;
         }
-        if (pcm.length > 0) {
+        if (len > 0) {
+            byte[] pcm = new byte[len];
+            payload.get(pcm);
             if (!connection.pipeline().offer(pcm)) {
                 sendError(connection.socket(), "overloaded", "Server cannot keep up with the audio stream");
                 close(connection.socket(), CloseStatus.SERVICE_OVERLOAD);
             } else {
-                audioBytesReceived.increment(pcm.length);
+                audioBytesReceived.increment(len);
             }
         }
     }
@@ -166,9 +170,14 @@ public class SpeechWebSocketHandler extends AbstractWebSocketHandler implements 
         if (connection == null) {
             return;
         }
+        String raw = message.getPayload();
+        if ("{\"type\":\"end\"}".equals(raw)) {
+            connection.pipeline().finish();
+            return;
+        }
         JsonNode command;
         try {
-            command = JSON.readTree(message.getPayload());
+            command = JSON.readTree(raw);
         } catch (JacksonException e) {
             sendError(connection.socket(), "invalid_command", "Text frame must be a JSON object");
             return;
@@ -206,15 +215,15 @@ public class SpeechWebSocketHandler extends AbstractWebSocketHandler implements 
             @Override
             public void onTranscript(TranscriptEvent event, long lagMillis) {
                 String type = event.type().name().toLowerCase(Locale.ROOT);
-                Counter.builder("stt.ws.utterances")
-                        .description("Transcript events delivered over WebSocket")
-                        .tag("type", type)
-                        .register(meters)
+                utteranceCounters.computeIfAbsent(type, t -> Counter.builder("stt.ws.utterances")
+                                .description("Transcript events delivered over WebSocket")
+                                .tag("type", t)
+                                .register(meters))
                         .increment();
-                Timer.builder("stt.ws.utterance.lag")
-                        .description("End-to-end wait and inference lag for WebSocket transcripts")
-                        .tag("type", type)
-                        .register(meters)
+                utteranceLagTimers.computeIfAbsent(type, t -> Timer.builder("stt.ws.utterance.lag")
+                                .description("End-to-end wait and inference lag for WebSocket transcripts")
+                                .tag("type", t)
+                                .register(meters))
                         .record(Math.max(0L, lagMillis), TimeUnit.MILLISECONDS);
                 send(socket, Map.of(
                         "type", type,
@@ -257,10 +266,10 @@ public class SpeechWebSocketHandler extends AbstractWebSocketHandler implements 
     }
 
     private void recordError(String code) {
-        Counter.builder("stt.ws.errors")
-                .description("Error frames sent to WebSocket clients")
-                .tag("code", code)
-                .register(meters)
+        errorCounters.computeIfAbsent(code, c -> Counter.builder("stt.ws.errors")
+                        .description("Error frames sent to WebSocket clients")
+                        .tag("code", c)
+                        .register(meters))
                 .increment();
     }
 

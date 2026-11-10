@@ -11,6 +11,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CountDownLatch;
@@ -64,6 +65,45 @@ class TranscriptionJobServiceTest {
             assertThat(engine.requestedModels).containsExactly("whisper-en", "whisper-en");
             assertThat(engine.releasedCount.get()).isEqualTo(1);
             assertThat(refinerReleased.get()).isEqualTo(1);
+        }
+    }
+
+    @Test
+    void groupsSegmentsIntoBatchesWhenEngineSupportsNativeBatching() throws Exception {
+        List<Integer> batchSizes = new ArrayList<>();
+        SpeechToTextEngine batchedEngine = new FakeSpeechToTextEngine("unused") {
+            @Override
+            public int maxBatchSize(String model) {
+                return 3;
+            }
+
+            @Override
+            public List<String> transcribeBatch(String model, List<float[]> batch) {
+                batchSizes.add(batch.size());
+                List<String> out = new ArrayList<>(batch.size());
+                for (int i = 0; i < batch.size(); i++) {
+                    out.add("seg-" + batchSizes.size() + "-" + i);
+                }
+                return out;
+            }
+        };
+        VoiceActivityDetector vad = wav -> List.of(
+                new SpeechSegment(0.0, 1.0),
+                new SpeechSegment(1.0, 2.0),
+                new SpeechSegment(2.0, 3.0),
+                new SpeechSegment(3.0, 4.0),
+                new SpeechSegment(4.0, 5.0));
+
+        try (TranscriptionJobService service = new TranscriptionJobService(
+                properties(false), batchedEngine, vad, text -> text, (in, out) -> copy(in, out))) {
+            TranscriptionJob submitted = service.submit(
+                    new ByteArrayInputStream(wavSeconds(5)), "meeting.wav", "qwen3-asr", false);
+            TranscriptionJob done = awaitTerminal(service, submitted.jobId());
+
+            assertThat(done.status()).isEqualTo(Status.DONE);
+            assertThat(batchSizes).containsExactly(3, 2);
+            assertThat(done.segments()).extracting(TranscriptionJob.Segment::text)
+                    .containsExactly("seg-1-0", "seg-1-1", "seg-1-2", "seg-2-0", "seg-2-1");
         }
     }
 
@@ -188,7 +228,7 @@ class TranscriptionJobServiceTest {
                 null,
                 new SttProperties.Refiner(refineEnabled, null, null, 2048, 0.1f, 1500, Duration.ofSeconds(5)),
                 null,
-                new SttProperties.Jobs(tempDir.toString(), 5, Duration.ofHours(1)));
+                new SttProperties.Jobs(tempDir.toString(), 5, Duration.ofHours(1), 4));
     }
 
     private static byte[] wavSeconds(int seconds) throws IOException {
