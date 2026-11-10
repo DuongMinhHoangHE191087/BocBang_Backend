@@ -10,6 +10,8 @@ final class TranscribeNative {
 
     static native String transcribe(long handle, float[] pcm16k, String language, String prompt);
 
+    static native String[] transcribeBatch(long handle, float[][] pcmBatch, String language, String prompt);
+
     static native void abort(long handle);
 
     static native void free(long handle);

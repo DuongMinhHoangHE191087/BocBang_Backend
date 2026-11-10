@@ -9,8 +9,10 @@ import io.micrometer.core.instrument.Gauge;
 import io.micrometer.core.instrument.MeterRegistry;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import java.io.IOException;
+import java.nio.channels.FileChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
@@ -75,28 +77,32 @@ public class JniVoiceActivityDetector implements VoiceActivityDetector, AutoClos
         }
 
         List<SpeechSegment> rawSegments = new ArrayList<>();
-        for (double windowStart = 0; windowStart + 1e-6 < duration; windowStart += WINDOW_SECONDS) {
-            double windowEnd = Math.min(duration, windowStart + WINDOW_SECONDS);
-            float[] samples = readWindow(wav, info, windowStart, windowEnd);
-            double offset = windowStart;
-            double[] bounds = gate.call("vad", Duration.ofMinutes(5), null, () -> {
-                long handle = ensureLoaded(modelFile);
-                return WhisperNative.vadDetect(
-                        handle,
-                        samples,
-                        config.threshold(),
-                        config.minSpeechDurationMs(),
-                        config.minSilenceDurationMs(),
-                        (float) config.maxSegmentSeconds(),
-                        config.speechPadMs());
-            });
-            for (int i = 0; i + 1 < bounds.length; i += 2) {
-                double start = Math.max(offset, offset + bounds[i]);
-                double end = Math.min(windowEnd, offset + bounds[i + 1]);
-                if (end > start) {
-                    rawSegments.add(new SpeechSegment(start, end));
+        try (FileChannel channel = FileChannel.open(wav, StandardOpenOption.READ)) {
+            for (double windowStart = 0; windowStart + 1e-6 < duration; windowStart += WINDOW_SECONDS) {
+                double windowEnd = Math.min(duration, windowStart + WINDOW_SECONDS);
+                float[] samples = readWindow(channel, wav, info, windowStart, windowEnd);
+                double offset = windowStart;
+                double[] bounds = gate.call("vad", Duration.ofMinutes(5), null, () -> {
+                    long handle = ensureLoaded(modelFile);
+                    return WhisperNative.vadDetect(
+                            handle,
+                            samples,
+                            config.threshold(),
+                            config.minSpeechDurationMs(),
+                            config.minSilenceDurationMs(),
+                            (float) config.maxSegmentSeconds(),
+                            config.speechPadMs());
+                });
+                for (int i = 0; i + 1 < bounds.length; i += 2) {
+                    double start = Math.max(offset, offset + bounds[i]);
+                    double end = Math.min(windowEnd, offset + bounds[i + 1]);
+                    if (end > start) {
+                        rawSegments.add(new SpeechSegment(start, end));
+                    }
                 }
             }
+        } catch (IOException e) {
+            throw new SpeechRecognitionException("Failed to read audio window from " + wav.getFileName(), e);
         }
         return mergeAndCap(rawSegments, config.maxSegmentSeconds(), config.maxMergeGapSeconds());
     }
@@ -122,9 +128,9 @@ public class JniVoiceActivityDetector implements VoiceActivityDetector, AutoClos
         return vadHandle;
     }
 
-    private static float[] readWindow(Path wav, Wav.Info info, double start, double end) {
+    private static float[] readWindow(FileChannel channel, Path wav, Wav.Info info, double start, double end) {
         try {
-            return Wav.readFloats(wav, info, start, end);
+            return Wav.readFloats(channel, info, start, end);
         } catch (IOException e) {
             throw new SpeechRecognitionException("Failed to read audio window from " + wav.getFileName(), e);
         }

@@ -12,7 +12,7 @@ final class JniSpeechSession implements SpeechSession {
     private final JniSpeechEngine engine;
     private final int maxBytes;
     private final int maxSeconds;
-    private final ByteArrayOutputStream utterance = new ByteArrayOutputStream();
+    private final PcmBuffer utterance = new PcmBuffer(32 * 1024);
 
     JniSpeechSession(JniSpeechEngine engine, int maxBytes, int maxSeconds) {
         this.engine = engine;
@@ -31,17 +31,27 @@ final class JniSpeechSession implements SpeechSession {
 
     @Override
     public TranscriptEvent finish() {
-        byte[] bytes = utterance.toByteArray();
-        utterance.reset();
-        if (bytes.length == 0) {
+        int len = utterance.size();
+        if (len == 0) {
             return TranscriptEvent.finalResult("");
         }
-        return TranscriptEvent.finalResult(
-                engine.transcribe(engine.defaultModel(), Wav.toFloats(bytes, bytes.length)));
+        float[] samples = Wav.toFloats(utterance.rawBuffer(), len);
+        utterance.reset();
+        return TranscriptEvent.finalResult(engine.transcribe(engine.defaultModel(), samples));
     }
 
     @Override
     public void close() {
         utterance.reset();
+    }
+
+    private static final class PcmBuffer extends ByteArrayOutputStream {
+        PcmBuffer(int initialCapacity) {
+            super(initialCapacity);
+        }
+
+        byte[] rawBuffer() {
+            return buf;
+        }
     }
 }

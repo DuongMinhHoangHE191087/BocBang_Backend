@@ -10,9 +10,11 @@ import io.micrometer.core.instrument.Timer;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import java.io.IOException;
 import java.io.InputStream;
+import java.nio.channels.FileChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
+import java.nio.file.StandardOpenOption;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
@@ -211,19 +213,45 @@ public class TranscriptionJobService implements AutoCloseable {
                     .description("Speech segments transcribed across long-audio jobs")
                     .tag("model", state.model)
                     .register(meters);
-            try {
-                for (int i = 0; i < speech.size(); i++) {
+            int configuredBatch = properties.jobs() != null ? properties.jobs().batchSize() : 1;
+            int batchStep = Math.max(1, Math.min(configuredBatch, engine.maxBatchSize(state.model)));
+            try (FileChannel wavChannel = FileChannel.open(normalized, StandardOpenOption.READ)) {
+                for (int i = 0; i < speech.size(); ) {
                     state.checkCancelled();
-                    SpeechSegment span = speech.get(i);
-                    float[] samples = Wav.readFloats(normalized, wavInfo, span.start(), span.end());
-                    String piece = engine.transcribe(state.model, samples).trim();
-                    segmentCounter.increment();
-                    if (!piece.isEmpty()) {
-                        state.segments.add(new Segment(
-                                state.segments.size(), roundMillis(span.start()), roundMillis(span.end()), piece));
+                    int end = Math.min(speech.size(), i + batchStep);
+                    if (end - i == 1) {
+                        SpeechSegment span = speech.get(i);
+                        float[] samples = Wav.readFloats(wavChannel, wavInfo, span.start(), span.end());
+                        String piece = engine.transcribe(state.model, samples).trim();
+                        segmentCounter.increment();
+                        if (!piece.isEmpty()) {
+                            state.segments.add(new Segment(
+                                    state.segments.size(), roundMillis(span.start()), roundMillis(span.end()), piece));
+                        }
+                        i = end;
+                    } else {
+                        List<float[]> windows = new ArrayList<>(end - i);
+                        for (int j = i; j < end; j++) {
+                            SpeechSegment span = speech.get(j);
+                            windows.add(Wav.readFloats(wavChannel, wavInfo, span.start(), span.end()));
+                        }
+                        List<String> pieces = engine.transcribeBatch(state.model, windows);
+                        segmentCounter.increment(end - i);
+                        for (int j = 0; j < end - i; j++) {
+                            String piece = j < pieces.size() && pieces.get(j) != null ? pieces.get(j).trim() : "";
+                            if (!piece.isEmpty()) {
+                                SpeechSegment span = speech.get(i + j);
+                                state.segments.add(new Segment(
+                                        state.segments.size(),
+                                        roundMillis(span.start()),
+                                        roundMillis(span.end()),
+                                        piece));
+                            }
+                        }
+                        i = end;
                     }
-                    double ratio = (i + 1.0) / speech.size();
-                    state.segmentCompleted(i + 1, 0.10 + 0.80 * ratio);
+                    double ratio = (double) i / speech.size();
+                    state.segmentCompleted(i, 0.10 + 0.80 * ratio);
                 }
             } finally {
                 recordStage(Stage.TRANSCRIBING, state.model, System.nanoTime() - transcribeStarted);

@@ -2,6 +2,7 @@ package com.bocbang.backend.stt;
 
 import java.io.IOException;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.List;
 
 /**
@@ -39,6 +40,29 @@ public interface SpeechToTextEngine {
      * @throws SpeechRecognitionException if the model fails
      */
     String transcribe(String model, float[] samples);
+
+    /**
+     * Maximum number of speech segments {@link #transcribeBatch(String, List)} can decode in a single
+     * native pass for {@code model}. Engines that decode one segment at a time return {@code 1}.
+     */
+    default int maxBatchSize(String model) {
+        return 1;
+    }
+
+    /**
+     * Transcribes a batch of normalized 16 kHz mono float arrays in order, amortizing model weight reads
+     * across utterances when the underlying engine supports batched GEMM decoding.
+     */
+    default List<String> transcribeBatch(String model, List<float[]> batch) {
+        if (batch == null || batch.isEmpty()) {
+            return List.of();
+        }
+        List<String> out = new ArrayList<>(batch.size());
+        for (float[] samples : batch) {
+            out.add(transcribe(model, samples));
+        }
+        return out;
+    }
 
     /** Transcribes one complete 16-bit mono WAV file at the engine's sample rate. */
     default String transcribe(String model, Path wav) {

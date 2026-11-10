@@ -35,7 +35,11 @@ public class FfmpegAudioConverter implements AudioConverter {
     public void convert(Path input, Path output) {
         if (isAlreadyNormalized(input)) {
             try {
-                Files.copy(input, output, StandardCopyOption.REPLACE_EXISTING);
+                try {
+                    Files.move(input, output, StandardCopyOption.REPLACE_EXISTING);
+                } catch (IOException moveFailed) {
+                    Files.copy(input, output, StandardCopyOption.REPLACE_EXISTING);
+                }
                 return;
             } catch (IOException ignored) {
                 // Fall back to ffmpeg below.
@@ -83,7 +87,7 @@ public class FfmpegAudioConverter implements AudioConverter {
     private boolean isAlreadyNormalized(Path input) {
         try {
             Wav.Info info = Wav.read(input);
-            return info.isPcm16Mono(sampleRate) && info.dataOffset() == Wav.HEADER_BYTES && info.dataLength() > 0;
+            return info.isPcm16Mono(sampleRate) && info.dataLength() > 0;
         } catch (IOException e) {
             return false;
         }

@@ -4,6 +4,7 @@ import java.time.Duration;
 import java.util.List;
 import java.util.Map;
 import org.springframework.boot.context.properties.ConfigurationProperties;
+import org.springframework.boot.context.properties.bind.ConstructorBinding;
 import org.springframework.boot.context.properties.bind.DefaultValue;
 
 /**
@@ -98,6 +99,15 @@ public record SttProperties(
     public record Jobs(
             String directory,
             @DefaultValue("20") int maxQueued,
-            @DefaultValue("24h") Duration resultTtl) {
+            @DefaultValue("24h") Duration resultTtl,
+            @DefaultValue("4") int batchSize) {
+
+        @ConstructorBinding
+        public Jobs {
+        }
+
+        public Jobs(String directory, int maxQueued, Duration resultTtl) {
+            this(directory, maxQueued, resultTtl, 4);
+        }
     }
 }

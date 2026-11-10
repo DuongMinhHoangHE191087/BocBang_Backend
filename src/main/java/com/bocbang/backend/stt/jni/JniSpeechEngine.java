@@ -10,6 +10,7 @@ import io.micrometer.core.instrument.MeterRegistry;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -94,6 +95,16 @@ public class JniSpeechEngine implements SpeechToTextEngine, AutoCloseable {
     }
 
     @Override
+    public int maxBatchSize(String model) {
+        String key = model == null || model.isBlank() ? defaultModel : model;
+        SttProperties.Model cfg = models.get(key);
+        if (cfg != null && cfg.backend() == Backend.TRANSCRIBE_CPP) {
+            return Math.max(1, properties.jobs() != null ? properties.jobs().batchSize() : 4);
+        }
+        return 1;
+    }
+
+    @Override
     public String transcribe(String model, float[] samples) {
         String key = model == null || model.isBlank() ? defaultModel : model;
         SttProperties.Model cfg = models.get(key);
@@ -112,6 +123,47 @@ public class JniSpeechEngine implements SpeechToTextEngine, AutoCloseable {
                         handle, samples, properties.threads(), nullToEmpty(cfg.language()));
             };
             return raw == null ? "" : raw.trim();
+        });
+    }
+
+    @Override
+    public List<String> transcribeBatch(String model, List<float[]> batch) {
+        if (batch == null || batch.isEmpty()) {
+            return List.of();
+        }
+        if (batch.size() == 1) {
+            return List.of(transcribe(model, batch.get(0)));
+        }
+        String key = model == null || model.isBlank() ? defaultModel : model;
+        SttProperties.Model cfg = models.get(key);
+        if (cfg == null) {
+            throw new IllegalArgumentException("Unknown ASR model '" + key + "', available: " + models.keySet());
+        }
+        if (cfg.backend() != Backend.TRANSCRIBE_CPP) {
+            return SpeechToTextEngine.super.transcribeBatch(key, batch);
+        }
+        float[][] pcmBatch = new float[batch.size()][];
+        boolean anySamples = false;
+        for (int i = 0; i < batch.size(); i++) {
+            float[] item = batch.get(i);
+            pcmBatch[i] = item == null ? new float[0] : item;
+            if (pcmBatch[i].length > 0) {
+                anySamples = true;
+            }
+        }
+        if (!anySamples) {
+            return batch.stream().map(x -> "").toList();
+        }
+        return gate.call("asr:" + key, cfg.timeout(), () -> abortActive(cfg.backend()), () -> {
+            long handle = ensureLoaded(key, cfg);
+            String[] raw = TranscribeNative.transcribeBatch(
+                    handle, pcmBatch, nullToEmpty(cfg.language()), nullToEmpty(cfg.prompt()));
+            List<String> out = new ArrayList<>(batch.size());
+            for (int i = 0; i < batch.size(); i++) {
+                String piece = raw != null && i < raw.length && raw[i] != null ? raw[i].trim() : "";
+                out.add(piece);
+            }
+            return out;
         });
     }
 

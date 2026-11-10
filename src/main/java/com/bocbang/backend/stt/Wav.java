@@ -109,6 +109,17 @@ public final class Wav {
 
     /** Reads the samples between two timestamps of {@code source} directly into a {@code float[]} array. */
     public static float[] readFloats(Path source, Info info, double startSeconds, double endSeconds) throws IOException {
+        try (FileChannel channel = FileChannel.open(source, StandardOpenOption.READ)) {
+            return readFloats(channel, info, startSeconds, endSeconds);
+        }
+    }
+
+    /**
+     * Reads the samples between two timestamps from an already-open {@link FileChannel} without
+     * reopening the file on every segment or VAD window.
+     */
+    public static float[] readFloats(FileChannel channel, Info info, double startSeconds, double endSeconds)
+            throws IOException {
         long frame = info.bytesPerFrame();
         long from = clamp(Math.round(startSeconds * info.sampleRate()) * frame, 0, info.dataLength());
         long to = clamp(Math.round(endSeconds * info.sampleRate()) * frame, from, info.dataLength());
@@ -119,15 +130,13 @@ public final class Wav {
         if (byteCount > Integer.MAX_VALUE) {
             throw new IllegalArgumentException("Audio slice is too large to fit in a single array: " + byteCount);
         }
-        try (FileChannel channel = FileChannel.open(source, StandardOpenOption.READ)) {
-            ByteBuffer raw = readFully(channel, info.dataOffset() + from, (int) byteCount);
-            int samples = (int) (byteCount / 2);
-            float[] out = new float[samples];
-            for (int i = 0; i < samples; i++) {
-                out[i] = raw.getShort() * PCM16_SCALE;
-            }
-            return out;
+        ByteBuffer raw = readFully(channel, info.dataOffset() + from, (int) byteCount);
+        int samples = (int) (byteCount / 2);
+        float[] out = new float[samples];
+        for (int i = 0; i < samples; i++) {
+            out[i] = raw.getShort() * PCM16_SCALE;
         }
+        return out;
     }
 
     private static ByteBuffer readFully(FileChannel channel, long position, int length) throws IOException {

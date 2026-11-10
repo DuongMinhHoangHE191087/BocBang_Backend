@@ -29,6 +29,8 @@ public class CpuExecutionGate implements AutoCloseable {
     private final ReentrantLock lock = new ReentrantLock(true);
     private final MeterRegistry meters;
     private final Map<String, AtomicInteger> activeByOperation = new ConcurrentHashMap<>();
+    private final Map<String, Timer> waitTimers = new ConcurrentHashMap<>();
+    private final Map<DurationKey, Timer> durationTimers = new ConcurrentHashMap<>();
     private final ScheduledExecutorService watchdog = Executors.newSingleThreadScheduledExecutor(r -> {
         Thread t = new Thread(r, "bocbang-jni-watchdog");
         t.setDaemon(true);
@@ -129,20 +131,23 @@ public class CpuExecutionGate implements AutoCloseable {
     }
 
     private void recordWait(String operation, long nanos) {
-        Timer.builder("stt.native.wait")
-                .description("Time spent waiting for the native C++ CPU gate")
-                .tag("operation", operation)
-                .register(meters)
+        waitTimers.computeIfAbsent(operation, op -> Timer.builder("stt.native.wait")
+                        .description("Time spent waiting for the native C++ CPU gate")
+                        .tag("operation", op)
+                        .register(meters))
                 .record(Math.max(0L, nanos), TimeUnit.NANOSECONDS);
     }
 
     private void recordDuration(String operation, String outcome, long nanos) {
-        Timer.builder("stt.native.duration")
-                .description("Time spent executing a native C++ JNI call")
-                .tag("operation", operation)
-                .tag("outcome", outcome)
-                .register(meters)
+        durationTimers.computeIfAbsent(new DurationKey(operation, outcome), k -> Timer.builder("stt.native.duration")
+                        .description("Time spent executing a native C++ JNI call")
+                        .tag("operation", k.operation())
+                        .tag("outcome", k.outcome())
+                        .register(meters))
                 .record(Math.max(0L, nanos), TimeUnit.NANOSECONDS);
+    }
+
+    private record DurationKey(String operation, String outcome) {
     }
 
     @Override
